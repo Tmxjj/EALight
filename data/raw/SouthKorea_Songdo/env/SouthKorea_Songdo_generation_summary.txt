@@ -1,0 +1,12 @@
+=== Generation Summary for SouthKorea_Songdo ===
+2026-04-30 00:02:37.594 | INFO     | __main__:generate_traffic_accident:98 - [Accident] 读取路网: data/raw/SouthKorea_Songdo/env/songdo.net.xml
+2026-04-30 00:02:37.612 | INFO     | __main__:generate_traffic_accident:338 - [Accident] 生成事故数: 1（含行人 0 个）
+2026-04-30 00:02:37.617 | INFO     | __main__:_merge_and_save:390 - [Merge] 已保存: data/raw/SouthKorea_Songdo/env/songdo_accident.rou.xml
+[Done] SouthKorea_Songdo 完成。输出文件:
+  Emergency:  data/raw/SouthKorea_Songdo/env/songdo_emergy.rou.xml
+  Bus:        data/raw/SouthKorea_Songdo/env/songdo_bus.rou.xml
+  Accident:   data/raw/SouthKorea_Songdo/env/songdo_accident.rou.xml
+  Debris:     data/raw/SouthKorea_Songdo/env/songdo_debris.rou.xml
+  Pedestrian: data/raw/SouthKorea_Songdo/env/songdo_pedestrian.rou.xml
+  Map:        data/raw/SouthKorea_Songdo/env/SouthKorea_Songdo_event_network.png
+  Summary:    data/raw/SouthKorea_Songdo/env/SouthKorea_Songdo_generation_summary.txt

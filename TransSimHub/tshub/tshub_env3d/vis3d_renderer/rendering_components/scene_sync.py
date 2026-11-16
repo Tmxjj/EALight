@@ -1,0 +1,410 @@
+import math
+from loguru import logger
+from typing import Dict, List
+
+from panda3d.core import Material, Vec4
+
+from ..traffic_elements.vehicle import Vehicle3DElement
+from ..traffic_elements.traffic_signals import TLS3DElement
+from ..traffic_elements.aircraft import Aircraft3DElement
+from ...vis3d_utils.core_math import calculate_center_point, calculate_inner_edge_point, vec_to_radians, vec_2d
+
+# 事件占位车辆的 vType ID 集合（精确匹配）及前缀（兼容带长度后缀的变体，如 barrier_A_5.00）
+# 这些车辆的 3D 渲染完全由 EmergencyManager3D 负责，scene_sync 不应为其创建 Vehicle3DElement，
+# 否则会在 SUMO stop 位置（区间中心）额外渲染一辆幽灵背景车辆。
+_EVENT_VTYPE_EXACT = frozenset({
+    'crash_vehicle_a', 'crash_vehicle_lane2', 'crash_vehicle_b', 
+    'pedestrian_lying', 'pedestrian_crossing',
+    'barrier_A', 'barrier_B', 'barrier_C', 'barrier_D', 'barrier_E',
+    'tree_branch_1lane', 'tree_branch_3lanes',
+})
+_EVENT_VTYPE_PREFIXES = ('barrier_', 'tree_branch_')
+
+
+def _is_event_vehicle(veh_type: str) -> bool:
+    """判断是否为事件占位车辆（由 EmergencyManager3D 专属渲染）"""
+    if veh_type in _EVENT_VTYPE_EXACT:
+        return True
+    for prefix in _EVENT_VTYPE_PREFIXES:
+        if veh_type.startswith(prefix):
+            return True
+    return False
+
+
+# SUMO heading（°）到东南西北方向名称的映射。
+# SUMO 定义：0° = 正北，顺时针增加（90° = 正东，180° = 正南，270° = 正西）。
+# 索引约定（顺时针）：0=North, 1=East, 2=South, 3=West。
+_DIRECTION_NAMES = ['North', 'East', 'South', 'West']
+_DIRECTION_SHORT  = ['N',     'E',    'S',     'W']
+
+def _heading_to_direction_index(id: str, heading_deg: float) -> int:
+    """将 SUMO heading（°，北=0 顺时针）映射到最近的方向索引（0=N,1=E,2=S,3=W）。"""
+    if id == "J2": # J2 为倾斜路口，特殊映射
+        if 180 <= heading_deg < 270: # 315156946#0 (222.12) -> North
+            return 0
+        elif 270 <= heading_deg <= 360: # 989312046#0 (330.66) -> East
+            return 1
+        elif 0 <= heading_deg < 90: # E1 (42.13) -> South
+            return 2
+        elif 90 <= heading_deg < 180: # 525074961#6 (152.77) -> West
+            return 3
+
+    # 进口道的 heading 是车辆行驶方向（朝向路口中心），因此：
+    # 从北方来的车辆行驶方向朝南（heading≈180°）→ 进口道在北方（North approach）
+    # 从东方来的车辆行驶方向朝西（heading≈270°）→ 进口道在东方（East approach）
+    # 所以需要将 heading 加 180° 再取模，得到进口道实际所在方位
+    approach_bearing = (heading_deg + 180.0) % 360.0
+    idx = int((approach_bearing + 45.0) / 90.0) % 4
+    return idx
+
+
+VALID_SENSORS = {
+    'aircraft': ['aircraft_all', 'aircraft_vehicle'],
+    'tls': [
+        'junction_front_all', 'junction_front_vehicle',
+        'junction_back_all', 'junction_back_vehicle'
+    ],
+    'upstream': [
+        'junction_front_all', 'junction_front_vehicle',
+    ],
+    'vehicle': [
+        'front_left_all', 'front_right_all', 'front_all', 
+        'back_left_all', 'back_right_all', 'back_all',
+        'front_left_vehicle', 'front_right_vehicle', 'front_vehicle', 
+        'back_left_vehicle', 'back_right_vehicle', 'back_vehicle',
+        'bev_all', 'bev_vehicle'
+    ]
+}
+
+
+class SceneSync(object):
+    def __init__(
+            self, root_np, showbase_instance, 
+            sensor_config:Dict[str, List[str]],
+            preset:str='480P', resolution:float=1.0,
+            vehicle_model:str='low'
+        ) -> None:
+        """同步场景内的 object
+
+        Args:
+            root_np: 场景的 Node
+            showbase_instance: Pnada3D ShowBase
+            sensor_config (Dict[str, List[str]]): 需要渲染的物体和对应的摄像头
+            preset (str, optional): 预设分辨率名称（如 '720x480', '360x240' , '512x512'等）. Defaults to '480p'.
+            resolution (float, optional): 缩放因子（默认 1.0 表示原尺寸, 0.5 表示半尺寸）. Defaults to 1.0.
+        """
+        self.root_np = root_np
+        self.showbase_instance = showbase_instance
+        self.vehicle_model = vehicle_model # 加载不同精度的车辆 3D 模型
+        self.sensor_config = sensor_config # 不同 object 加载的传感器类型
+
+        # 获得传感器输出的图像的分辨率和大小
+        presets = {
+            '320P': (320, 240),   # 320x240（类 NTSC 标清）
+            '480P': (720, 480),   # 720x480（标准 480P）
+            '720P': (1280, 720),  # 1280x720（HD 标清）
+            '1080P': (1920, 1080), # 1920x1080（Full HD）
+            'SQUARE_512': (512, 512), # 自定义 1:1 长宽比
+            'SQUARE_720': (720, 720), # 自定义 1:1 长宽比
+            'SQUARE_1024': (1024, 1024), # 自定义 1:1 长宽比
+            'SQUARE_2048': (2048, 2048), # 自定义 1:1 长宽比
+            'SQUARE_4096': (4096, 4096) # 自定义 1:1 长宽比 
+        }
+        if preset not in presets:
+            raise ValueError(f"Invalid preset: {preset}. Valid presets are: {list(presets.keys())}")
+        self.fig_width, self.fig_height = presets.get(preset) # 获得图像的长和宽
+        self.resolution = resolution
+
+        if not SceneSync.validate_sensor_config(sensor_config):
+            logger.info("SIM: Sensor configuration validation failed. Please check the errors above.")
+            raise ValueError(f"传感器文件配置错误, {sensor_config}")
+            
+        # 记录场景中的 element
+        self._vehicle_elements = {} # 加入渲染的车辆
+        self._tls_elements = {} # 加入信号灯 (每一个 in road 会有一个), 这里信号灯没有实体, 只有 sensor
+        self._aircraft_elements = {} # 目前 aircraft 没有实体, 只有摄像头
+        self._upstream_elements = {} # 上游摄像头（每个进口道上游端一个），无实体只有 sensor
+
+    @staticmethod
+    def validate_sensor_config(sensor_config: Dict[str, List[str]]) -> bool:
+        """Validate the sensor configuration against the predefined valid sensors.
+        """
+        for category, object_sensors in sensor_config.items():
+            # 1. 检测安装传感器的 object 类型是否符合标准, 只支持三种, 分别是 vehicle, tls 和 aircraft
+            if category not in VALID_SENSORS: # 只能给三种类型的 objects 安装传感器
+                logger.error(f"SIM: Invalid category: {category}. Valid categories are {list(VALID_SENSORS.keys())}.")
+                return False
+            
+            # 2. 检测具体的传感器类型是否符合要求, 例如 tls 支持 junction_front_all 
+            for object_id, sensors_info in object_sensors.items():            
+                # 检测传感器的类型
+                invalid_sensors = set(sensors_info.get('sensor_types', [])) - set(VALID_SENSORS[category])
+                if invalid_sensors:
+                    logger.error(f"SIM: Invalid sensors in {category}: {invalid_sensors}. Valid sensors are {VALID_SENSORS[category]}.")
+                    return False
+        return True
+
+    def reset(self, tshub_init_obs) -> None:
+        # 初始化 & 关闭所有车辆和飞行器的 sensors
+        self.remove_missing_elements(set(), self._vehicle_elements, 'vehicle')
+        self.remove_missing_elements(set(), self._aircraft_elements, 'aircraft')
+
+        # 初始化进口道信号灯摄像头
+        if (not self._tls_elements) and ("tls" in tshub_init_obs) and ("tls" in self.sensor_config):
+            for tls_id, tls_info in tshub_init_obs['tls'].items():
+                if tls_id in self.sensor_config['tls']:
+                    self._initialize_tls_elements(tls_id, tls_info)
+
+        # 初始化上游摄像头（需在 sensor_config 中配置 'upstream' 键）
+        if (not self._upstream_elements) and ("tls" in tshub_init_obs) and ("upstream" in self.sensor_config):
+            for tls_id, tls_info in tshub_init_obs['tls'].items():
+                if tls_id in self.sensor_config['upstream']:
+                    self._initialize_upstream_elements(tls_id, tls_info)
+
+    def _initialize_tls_elements(self, tls_id, tls_info) -> None:
+        """初始化某一个路口的进口道摄像头（停止线处）。
+        element_id 格式：{tls_id}_{direction_short}，例如 J1_N / J1_E / J1_S / J1_W。
+        """
+        tls_cfg = self.sensor_config['tls'][tls_id]
+        sensor_types     = tls_cfg.get('sensor_types', [])
+        tls_camera_height = tls_cfg.get('tls_camera_height', 10)
+        # 俯仰角（°）：None → OffscreenJunctionFrontCamera 使用原始 height//3 lookAt 模式
+        camera_pitch_deg = tls_cfg.get('camera_pitch_deg', None)
+        # 纵向后退距离（米）：0 = 位于停止线正上方，建议 5–15m 以扩大近端视野
+        camera_setback   = tls_cfg.get('camera_setback', 0)
+        # 横向偏移（米）：正值 = 向中间分隔带（内侧），负值 = 向路肩（外侧），0 = 不偏移
+        camera_lateral   = tls_cfg.get('camera_lateral', 0)
+        # 按 heading 从小到大排序（SUMO 北=0 顺时针），保证顺序稳定
+        sorted_road_ids = sorted(tls_info['in_roads_heading'], key=tls_info['in_roads_heading'].get)
+
+        for road_id in sorted_road_ids:
+            heading = tls_info['in_roads_heading'][road_id]
+            dir_idx = _heading_to_direction_index(tls_id, heading)
+            dir_short = _DIRECTION_SHORT[dir_idx]
+            tls_element_id = f'{tls_id}_{dir_short}'
+            position = calculate_center_point(tls_info['in_road_stop_line'][road_id])
+            element = TLS3DElement(
+                fig_width=self.fig_width,
+                fig_height=self.fig_height,
+                fig_resolution=self.resolution,
+                element_id=tls_element_id,
+                element_position=position,
+                element_heading=heading,
+                root_np=self.root_np,
+                showbase_instance=self.showbase_instance,
+                tls_camera_height=tls_camera_height,
+                camera_pitch_deg=camera_pitch_deg,
+                camera_setback=camera_setback,
+                camera_lateral=camera_lateral,
+            )
+            element.attach_sensors_to_element(sensor_types)
+            self._tls_elements[tls_element_id] = element
+            logger.info(f'SIM: Init approach cam [{tls_element_id}] roadid={road_id} heading={heading:.1f}° dir={_DIRECTION_NAMES[dir_idx]}')
+
+    def _initialize_upstream_elements(self, tls_id, tls_info) -> None:
+        """初始化某一个路口的上游道路摄像头。
+        如果进口道长度 >= 300m，摄像头将安装在上游 300m 处（考虑弯道）；若 < 300m，则安装在 lane 起点（最上游端）。
+        摄像头朝向与进口道行驶方向相反。拍摄的方向为这个道路下游方向
+        element_id 格式：upstream_{tls_id}_{direction_short}，例如 upstream_J1_N。
+        传感器图像 key 格式：junction_front_all_upstream_{tls_id}_{direction_short}。
+
+        位置来源：tls_info['in_road_upstream_point'][road_id] 中各 lane 设定的坐标均值。
+        若该字段不存在（旧版 TrafficLightInfo），则跳过并给出警告。
+        """
+        upstream_cfg  = self.sensor_config['upstream'].get(tls_id, {})
+        sensor_types  = upstream_cfg.get('sensor_types', ['junction_front_all'])
+        camera_height = upstream_cfg.get('tls_camera_height', 15)
+        # 俯仰角（°）：None → 原始模式；上游摄像头需要较浅角度以覆盖远端路段，建议 20°–35°
+        camera_pitch_deg = upstream_cfg.get('camera_pitch_deg', None)
+        # 纵向后退偏移（米）：上游摄像头通常 = 0（位于上游端点正上方，已有 300m 视距）
+        camera_setback   = upstream_cfg.get('camera_setback', 0)
+        # 横向偏移（米）：正值 = 向中间分隔带（内侧），负值 = 向路肩（外侧），0 = 不偏移
+        camera_lateral   = upstream_cfg.get('camera_lateral', 0)
+
+        upstream_points = tls_info.get('in_road_upstream_point')
+        if not upstream_points:
+            logger.warning(
+                f'SIM: tls_info 中缺少 in_road_upstream_point，跳过路口 {tls_id} 的上游摄像头初始化。'
+                f'请确认 BaseTLS 已更新以计算上游端坐标。'
+            )
+            return
+
+        sorted_road_ids = sorted(tls_info['in_roads_heading'], key=tls_info['in_roads_heading'].get)
+
+        for road_id in sorted_road_ids:
+            if road_id not in upstream_points or not upstream_points[road_id]:
+                logger.warning(f'SIM: road {road_id} 无上游端坐标，跳过上游摄像头。')
+                continue
+
+            heading = tls_info['in_roads_heading'][road_id]
+            dir_idx = _heading_to_direction_index(tls_id,heading)
+            dir_short = _DIRECTION_SHORT[dir_idx]
+            element_id = f'upstream_{tls_id}_{dir_short}'
+            position = calculate_inner_edge_point(upstream_points[road_id],heading)
+            # position = calculate_center_point(upstream_points[road_id])
+
+            # 上游摄像头朝向与进口道行驶方向相反（拍摄这个道路下游方向）
+            camera_heading = (heading + 180) % 360
+            element = TLS3DElement(
+                fig_width=self.fig_width,
+                fig_height=self.fig_height,
+                fig_resolution=self.resolution,
+                element_id=element_id,
+                element_position=position,
+                element_heading=camera_heading,
+                root_np=self.root_np,
+                showbase_instance=self.showbase_instance,
+                tls_camera_height=camera_height,
+                camera_pitch_deg=camera_pitch_deg,
+                camera_setback=camera_setback,
+                camera_lateral=camera_lateral,
+            )
+            element.attach_sensors_to_element(sensor_types)
+            self._upstream_elements[element_id] = element
+            logger.info(
+                f'SIM: Init upstream cam [{element_id}] roadid={road_id} pos={position} '
+                f'heading={heading:.1f}° dir={_DIRECTION_NAMES[dir_idx]} (Targeting ~300m upstream)'
+            )
+
+
+    def _sync(self, tshub_obs):
+        # 更新车辆和飞行器
+        veh_ids, aircraft_ids = self.update_elements(tshub_obs)
+        
+        # 管理离开的 vehicle 和 aircraft
+        self.remove_missing_elements(veh_ids, self._vehicle_elements, 'vehicle')
+        self.remove_missing_elements(aircraft_ids, self._aircraft_elements, 'aircraft')
+        
+        # 更新 camera
+        logger.info(f'SIM: Update All Sensors Positions.')
+        self.showbase_instance.taskMgr.step()
+        
+        # 所有传感器渲染
+        self.showbase_instance.graphicsEngine.renderFrame()
+
+        # 获得 camera 的数据（进口道摄像头 + 上游摄像头 + 车辆传感器 + 飞行器摄像头）
+        _sensors = {
+            **self.collect_sensors(self._tls_elements),
+            **self.collect_sensors(self._upstream_elements),
+            **self.collect_sensors(self._vehicle_elements),
+            **self.collect_sensors(self._aircraft_elements)
+        }
+        return _sensors
+
+    def update_elements(self, tshub_obs):
+        """跟据 SUMO 的观测更新 vehicle 和 aircraft 的信息, 会分别调用:
+        1. self._manage_vehicle_element: 更新车辆信息
+        2. self._manage_aircraft_element 更新飞行器信息
+        """
+        # 每一步需要处理的 vehicles 和 aircrafts 的 ids
+        # 有两类 objects, 分别是:
+        # - 需要挂载传感器在 object 上面 (需要同时满足出现在场景且需要挂载传感器)
+        # - 不需要挂载传感器, 只需要使用 panda3d 在场景中渲染出来
+        veh_ids, aircraft_ids = set(), set()
+
+        # 1. 更新车辆的信息 (如果出现在 SUMO 中就需要在 tshub3d 中进行渲染)
+        for veh_id, veh_info in tshub_obs.get('vehicle', {}).items():
+            veh_ids.add(veh_id)
+            self._manage_vehicle_element(veh_id, veh_info)
+
+        # 2. 更新飞行器的信息 (如果出现在 SUMO 中就需要在 tshub3d 中进行渲染)
+        for aircraft_id, aircraft_info in tshub_obs.get('aircraft', {}).items():
+            aircraft_ids.add(aircraft_id)
+            self._manage_aircraft_element(aircraft_id, aircraft_info)         
+
+        return veh_ids, aircraft_ids
+
+    def _manage_vehicle_element(self, veh_id, veh_info) -> None:
+        # 事件占位车辆（路障、碰撞残骸、倒地行人等）由 EmergencyManager3D 专属渲染，
+        # 跳过 Vehicle3DElement 避免在 SUMO stop 位置产生幽灵背景车辆
+        if _is_event_vehicle(veh_info['vehicle_type']):
+            return
+
+        # 获得车辆传感器的配置信息
+        element = self._vehicle_elements.get(veh_id)
+        if not element: # 如果车辆不存在
+            element = Vehicle3DElement(
+                fig_width = self.fig_width,
+                fig_height = self.fig_height,
+                fig_resolution = self.resolution,
+                vehicle_model=self.vehicle_model,
+                veh_id=veh_id, 
+                veh_type=veh_info['vehicle_type'], 
+                veh_pos=veh_info['position'], 
+                veh_heading=veh_info['heading'], 
+                veh_length=veh_info['length'], 
+                root_np=self.root_np, 
+                showbase_instance=self.showbase_instance
+            )
+            element.create_node()
+            element.begin_rendering_node()
+            # 应用共享的高光材质, 让车漆有镜面反射, 并确保被定向光正常照亮 -> 产生投射阴影
+            # priority=1 覆盖 GLB 自带材质 (很多车模带有无金属感的哑光材质)
+            if element.veh_node_path is not None:
+                
+                # 1. 强行清除 GLB 模型自带的 Shader，强迫其继承 _root_np 的 simplepbr Shader
+                element.veh_node_path.clearShader() 
+                for child in element.veh_node_path.findAllMatches("**"):
+                    child.clearShader()
+                from ...vis3d_utils.masks import CamMask  # 确保文件顶部引入了 CamMask
+                # 2. 确保阴影相机能看见车辆 (投射方):
+                element.veh_node_path.hide(CamMask.AllOn)
+                element.veh_node_path.show(CamMask.VehMask)
+                
+                # 3. 确保车辆向深度缓冲区写入数据（投射阴影的前提）
+                element.veh_node_path.set_depth_write(True)
+                
+            # 只有特定的车辆才需要挂载传感器
+            if veh_id in self.sensor_config.get('vehicle', {}):
+                sensor_types = self.sensor_config['vehicle'][veh_id].get('sensor_types', []) # 车辆需要安装的传感器
+                element.attach_sensors_to_element(sensor_types)
+            self._vehicle_elements[veh_id] = element
+        else:
+            element.update_node(
+                veh_position=veh_info['position'], 
+                veh_heading=veh_info['heading'], 
+                veh_type=veh_info['vehicle_type']
+            )
+
+    def _manage_aircraft_element(self, aircraft_id, aircraft_info) -> None:
+        heading = math.degrees(vec_to_radians(vec_2d(aircraft_info['heading']))) % 360
+        element = self._aircraft_elements.get(aircraft_id)
+        if not element:
+            element = Aircraft3DElement(
+                fig_width = self.fig_width,
+                fig_height = self.fig_height,
+                fig_resolution = self.resolution,
+                aircraft_id=aircraft_id, 
+                aircraft_pos=aircraft_info['position'], 
+                aircraft_heading=heading, 
+                root_np=self.root_np, 
+                showbase_instance=self.showbase_instance
+            )
+            # 优先使用针对该 aircraft_id 的配置，若不存在则回退到 default 通用配置
+            aircraft_cfg = self.sensor_config.get('aircraft', {})
+            sensor_types = []
+            if aircraft_id in aircraft_cfg:
+                sensor_types = aircraft_cfg[aircraft_id].get('sensor_types', [])
+            elif 'default' in aircraft_cfg:
+                sensor_types = aircraft_cfg['default'].get('sensor_types', [])
+            if sensor_types:
+                element.attach_sensors_to_element(sensor_types)
+            self._aircraft_elements[aircraft_id] = element
+        else:
+            element.update_sensor(aircraft_info['position'], heading)
+
+    def remove_missing_elements(self, current_ids, elements, element_type):
+        missing_ids = set(elements) - current_ids # 计算减少的 id
+        for id in missing_ids:
+            elements[id].remove_node() # tarffic element 中调用 remove node
+            del elements[id]
+            logger.info(f'SIM: 3D, Del {element_type} {id} since it leaves the scenario.')
+
+    def collect_sensors(self, elements):
+        # 获得传感器数据
+        sensor_outputs = {} # 获得传感器的输出
+        for id, element in elements.items():
+            _sensor_output = element.get_sensor()
+            if _sensor_output:
+                sensor_outputs[id] = _sensor_output
+        return sensor_outputs

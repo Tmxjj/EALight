@@ -1,0 +1,982 @@
+import os
+import sys
+import importlib
+import importlib.util
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, '..', '..'))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+import re
+import copy
+import cv2
+import json
+import time
+import random
+import argparse
+from typing import Dict, List
+
+from loguru import logger
+from tshub.utils.init_log import set_logger
+from utils.make_tsc_env import make_env
+from utils.tools import save_to_json, create_folder, write_response_to_file, convert_rgb_to_bgr
+from configs.scenairo_config import SCENARIO_CONFIGS
+from configs.env_config import TSHUB_ENV_CONFIG
+from configs.model_config import MODEL_CONFIG
+from inference.vlm_agent import VLMAgent
+from src.utils.event_bulletin import EventBulletin
+from src.utils.tsc_env.tsc_wrapper import GREEN_DURATION_CANDIDATES, FIXED_TIME_GREEN_DURATION
+from src.training.rlvr.gt_collector import collect_ground_truth
+
+sys.path.insert(0, os.path.join(_PROJECT_ROOT, "scripts"))
+# 视觉鲁棒性扰动模块：对模型输入图像施加遮挡 / 噪声 / 低分辨率退化
+from visual_robustness import (
+    apply_visual_perturbation,
+    VALID_PERTURB_TYPES,
+    VALID_LEVELS,
+)
+
+# 合法 scene_type 列表
+# emergy_bus      : 紧急车辆 + 公交/校车混合路由（*_emergy_bus.rou.xml）
+# accident_debris : 交通事故 + 路面碎片混合路由（*_accident_debris.rou.xml）
+# normal_triple   : NewYork 高密度流量变体
+VALID_SCENE_TYPES = [
+    "normal", "emergency", "bus", "accident", "debris", "pedestrian",
+    "emergy_bus", "accident_debris", "normal_triple",
+]
+NORMAL_SCENE_TYPES = {"normal", "normal_triple"}
+EVENT_BULLETIN_AUTO_SCENE_TYPES = {"accident_debris"}
+
+
+def configure_gpu_visibility(gpu_id):
+    """在创建渲染环境和加载模型前限制当前进程可见 GPU。
+
+    说明：
+      - 仅影响当前 Python 进程及其子进程；
+      - 对本地 EGL 渲染与本地 CUDA 模型生效；
+      - 若 VLM 走远端 API，请求发往哪台服务/哪张卡不受这里控制。
+    """
+    if gpu_id is None:
+        return None
+
+    gpu_id_str = str(gpu_id).strip()
+    if not gpu_id_str:
+        return None
+
+    # 这里在 Python 入口层再设置一遍，而不是只依赖外部 shell 脚本，原因是：
+    #   1. 直接用 `python run_eval.py --gpu_id N` 启动时也应当生效；
+    #   2. 让 GPU 选择尽可能靠近环境初始化/模型加载时刻，行为更稳定；
+    #   3. 即使后续有人绕过 vgl_python.sh 调试，也不会出现“参数传了但没生效”。
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id_str
+    os.environ["EGL_VISIBLE_DEVICES"] = gpu_id_str
+    os.environ["VGL_GPU"] = gpu_id_str
+    return gpu_id_str
+
+
+def _normalize_seed_value(seed_value):
+    """Normalize seed input to int/string/None.
+
+    Accepts integers, numeric strings, and the literal "random".
+    """
+    if seed_value is None:
+        return None
+    if isinstance(seed_value, int):
+        return seed_value
+    if isinstance(seed_value, str):
+        seed_text = seed_value.strip()
+        if not seed_text:
+            return None
+        if seed_text.lower() == "random":
+            return "random"
+        try:
+            return int(seed_text)
+        except ValueError:
+            return seed_text
+    return seed_value
+
+
+def load_prompt_builder(prompt_builder: str):
+    """Load a PromptBuilder class from a module name or a .py file path."""
+    prompt_builder = (prompt_builder or "configs.prompt_builder").strip()
+    if not prompt_builder:
+        prompt_builder = "configs.prompt_builder"
+
+    if prompt_builder.endswith(".py") or os.path.sep in prompt_builder:
+        path = prompt_builder
+        if not os.path.isabs(path):
+            path = os.path.join(_PROJECT_ROOT, path)
+        path = os.path.abspath(path)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Prompt builder file not found: {path}")
+        module_name = f"_eval_prompt_builder_{abs(hash(path))}"
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load prompt builder from: {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        source = path
+    else:
+        module = importlib.import_module(prompt_builder)
+        source = prompt_builder
+
+    builder = getattr(module, "PromptBuilder", None)
+    if builder is None or not hasattr(builder, "build_decision_prompt"):
+        raise AttributeError(
+            f"{source} must define PromptBuilder.build_decision_prompt(...)"
+        )
+    return builder, source
+
+
+def resolve_event_bulletin_mode(mode: str, scene_type: str) -> bool:
+    """Resolve EventBulletin mode into an enabled flag."""
+    mode = (mode or "auto").strip().lower()
+    if mode == "auto":
+        return scene_type in EVENT_BULLETIN_AUTO_SCENE_TYPES
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    raise ValueError(f"Invalid event_bulletin mode: {mode}. Expected auto/on/off.")
+
+
+def resolve_robust_config(robust_perturb, robust_level, is_baseline):
+    """解析视觉鲁棒性扰动配置，返回 (perturb_type, level, enabled) 三元组。
+
+    规则：
+      - robust_perturb 为 None / "none" 时关闭扰动（enabled=False）；
+      - 基线模式（FixedTime / MaxPressure / Random）不渲染图像，扰动无意义，
+        故强制关闭并打印告警，避免用户误以为基线也被施加了退化；
+      - 非法的扰动类型 / 强度档位直接抛出 ValueError，避免静默跑错实验。
+    """
+    perturb = str(robust_perturb or "none").strip().lower()
+    level = str(robust_level or "medium").strip().lower()
+
+    if perturb in ("", "none"):
+        return None, level, False
+
+    if perturb not in VALID_PERTURB_TYPES:
+        raise ValueError(
+            f"Invalid robust_perturb: {perturb}. "
+            f"Expected one of {VALID_PERTURB_TYPES} or 'none'."
+        )
+    if level not in VALID_LEVELS:
+        raise ValueError(
+            f"Invalid robust_level: {level}. Expected one of {VALID_LEVELS}."
+        )
+
+    if is_baseline:
+        logger.warning(
+            "[EVAL] 基线模式不渲染图像，已忽略视觉鲁棒性扰动请求 "
+            f"(robust_perturb={perturb}, robust_level={level})"
+        )
+        return None, level, False
+
+    return perturb, level, True
+
+
+class Evaluator:
+    """
+    端到端评测主类，支持四种运行模式：
+      - VLM 模式（默认）：调用视觉语言模型进行信号决策（异步，各路口独立绿灯时长）
+      - FixedTime 模式（--fixed_time）：固定配时基线（27s+3s黄灯=30s整步）
+      - MaxPressure 模式（--max_pressure）：排队最大压力基线
+      - Random 模式（--random）：随机选择相位和绿灯时长
+
+    输出路径：data/eval/{scenario_key}/{route_stem}/{model_name}_seed_{sumo_seed}/{intersection_id}/{sumo_step}/
+    """
+
+    def __init__(self, scenario_key="JiNan", log_dir="./log/eval_results", route_file=None,
+                 batch_size=12, use_fixed_time=False, use_max_pressure=False,
+                 use_random=False, warm_up_time=None,
+                 api_url=None, model_name_override=None, scene_type="normal",
+                 temperature=None, max_new_tokens=None, sumo_seed=None,
+                 prompt_builder="configs.prompt_builder", result_name=None,
+                 event_bulletin="auto", robust_perturb=None, robust_level="medium"):
+        self.scenario_key = scenario_key
+        self.log_dir = log_dir
+        self.use_fixed_time = use_fixed_time
+        self.use_max_pressure = use_max_pressure
+        self.use_random = use_random
+        # ── 视觉鲁棒性扰动配置 ──────────────────────────────────────────────
+        # 仅在 VLM 模式下生效；基线不渲染图像，会被强制关闭（见 resolve_robust_config）。
+        self.robust_perturb, self.robust_level, self.robust_enabled = resolve_robust_config(
+            robust_perturb,
+            robust_level,
+            is_baseline=(use_fixed_time or use_max_pressure or use_random),
+        )
+        self.warm_up_time = int(warm_up_time) if warm_up_time is not None else None
+        self.api_url = api_url
+        self.model_name_override = model_name_override
+        self.result_name = result_name
+        self.scene_type = scene_type
+        self.event_bulletin_mode = (event_bulletin or "auto").strip().lower()
+        self.enable_event_bulletin = resolve_event_bulletin_mode(
+            self.event_bulletin_mode,
+            self.scene_type,
+        )
+        self.temperature = temperature
+        self.max_new_tokens = max_new_tokens
+        self.prompt_builder_arg = prompt_builder
+        self.PromptBuilder, self.prompt_builder_source = load_prompt_builder(prompt_builder)
+        self.duration_candidates = list(
+            getattr(self.PromptBuilder, "DURATION_OPTIONS", GREEN_DURATION_CANDIDATES)
+        )
+        if not self.duration_candidates:
+            self.duration_candidates = list(GREEN_DURATION_CANDIDATES)
+        self.route_file = route_file
+        self.sumo_seed = _normalize_seed_value(
+            TSHUB_ENV_CONFIG.get("sumo_seed") if sumo_seed is None else sumo_seed
+        )
+        self.seed_suffix = (
+            f"_seed_{self.sumo_seed}"
+            if self.sumo_seed is not None and self.sumo_seed != "random"
+            else ""
+        )
+        if isinstance(self.sumo_seed, int):
+            random.seed(self.sumo_seed)
+
+        # --- 1. 加载场景配置 ---
+        self.scenario_config = SCENARIO_CONFIGS.get(scenario_key)
+        if not self.scenario_config:
+            logger.error(f"[EVAL] Scenario '{scenario_key}' not found in SCENARIO_CONFIGS")
+            raise ValueError(f"Scenario '{scenario_key}' not found in SCENARIO_CONFIGS")
+
+        self.scenario_name = self.scenario_config["SCENARIO_NAME"]
+        self.junction_name = self.scenario_config["JUNCTION_NAME"]
+        num_junctions = len(self.junction_name) if isinstance(self.junction_name, list) else 1
+        self.batch_size = min(batch_size, num_junctions)
+        logger.info(
+            f"[EVAL] Concurrency set to {self.batch_size} "
+            f"(Requested: {batch_size}, Junctions: {num_junctions})"
+        )
+
+        # 根据运行模式确定 model_name（用于目录命名）
+        if self.use_max_pressure:
+            model_name = f"max_pressure_{FIXED_TIME_GREEN_DURATION}s"
+        elif self.use_random:
+            model_name = "random"
+        elif self.use_fixed_time:
+            model_name = f"fixed_time_{FIXED_TIME_GREEN_DURATION}s"
+        else:
+            inference_model_name = (
+                self.model_name_override
+                or MODEL_CONFIG.get(
+                    MODEL_CONFIG.get("api_type", "local_model"), {}
+                ).get("model_name", "N/A")
+            )
+            model_name = self.result_name or inference_model_name
+        # 鲁棒性实验：在方法名后追加 _{perturb}_{level} 后缀，
+        # 使扰动结果与干净基线结果落到不同目录、互不覆盖。
+        robust_suffix = (
+            f"_{self.robust_perturb}_{self.robust_level}" if self.robust_enabled else ""
+        )
+        self.base_model_name = f"{model_name}{robust_suffix}"
+        self.model_name = (
+            f"{self.base_model_name}{self.seed_suffix}"
+            if self.seed_suffix else self.base_model_name
+        )
+
+        # SUMO 文件路径
+        base_sumo_cfg = os.path.join(
+            _PROJECT_ROOT, "data", "raw", self.scenario_name,
+            f"{self.scenario_config['NETFILE']}.sumocfg"
+        )
+        scenario_glb_dir = os.path.join(_PROJECT_ROOT, "data", "raw", self.scenario_name, "3d_assets")
+
+        # 处理自定义路由文件
+        sumo_cfg = base_sumo_cfg
+        if route_file:
+            route_file_name = os.path.basename(route_file)
+            try:
+                with open(base_sumo_cfg, 'r') as f:
+                    cfg_content = f.read()
+                new_route_path = f"./env/{route_file_name}"
+                cfg_content = re.sub(
+                    r'<route-files value="[^"]+"/>',
+                    f'<route-files value="{new_route_path}"/>',
+                    cfg_content, count=1
+                )
+                route_stem = os.path.splitext(route_file_name)[0]
+                self.temp_cfg_path = os.path.join(
+                    os.path.dirname(base_sumo_cfg), f"temp_{route_stem}.sumocfg"
+                )
+                with open(self.temp_cfg_path, 'w') as f:
+                    f.write(cfg_content)
+                sumo_cfg = self.temp_cfg_path
+                logger.info(f"[EVAL] Temporary SUMO config created: {sumo_cfg}")
+            except Exception as e:
+                logger.error(f"[EVAL] Failed to create temp SUMO config: {e}")
+        else:
+            try:
+                with open(base_sumo_cfg, 'r') as f:
+                    cfg_content = f.read()
+                match = re.search(r'<route-files value="([^"]+)"/>', cfg_content)
+                route_file_name = os.path.basename(match.group(1)) if match else "default_route.rou.xml"
+            except Exception:
+                route_file_name = "default_route.rou.xml"
+
+        route_stem = route_file_name
+        if route_stem.endswith(".rou.xml"):
+            route_stem = route_stem[:-8]
+        elif route_stem.endswith(".xml"):
+            route_stem = route_stem[:-4]
+
+        # 日志路径
+        self.logger_root_path = os.path.join(self.log_dir, self.scenario_key, route_stem, self.model_name)
+        create_folder(self.logger_root_path)
+        log_session = set_logger(self.logger_root_path, terminal_log_level='INFO')
+        if isinstance(log_session, dict) and log_session.get("log_dir"):
+            self.logger_path = log_session["log_dir"]
+        else:
+            self.logger_path = self.logger_root_path
+        logger.info(f"[EVAL] Log dir: {self.logger_path}")
+        logger.info(
+            f"[EVAL] Scene type: {self.scene_type} | "
+            f"event_bulletin={'enabled' if self.enable_event_bulletin else 'disabled'} "
+            f"(mode={self.event_bulletin_mode})"
+        )
+        logger.info(f"[EVAL] Prompt builder: {self.prompt_builder_source}")
+        logger.info(f"[EVAL] VLM duration candidates: {self.duration_candidates}")
+        logger.info(f"[EVAL] Warm-up time: {self.warm_up_time}")
+        if self.robust_enabled:
+            logger.info(
+                f"[EVAL] 视觉鲁棒性扰动: ENABLED | type={self.robust_perturb} | "
+                f"level={self.robust_level}"
+            )
+        else:
+            logger.info("[EVAL] 视觉鲁棒性扰动: disabled")
+
+        # 输出根目录：data/eval/{scenario_key}/{route_stem}/{model_name}_seed_{sumo_seed}/
+        # 图像将存储在：{output_folder}/{intersection_id}/{sumo_step}/
+        self.output_folder = os.path.join(
+            _PROJECT_ROOT, "data", "eval", self.scenario_key, route_stem, self.model_name
+        )
+        create_folder(self.output_folder)
+        self.route_stem = route_stem
+
+        trip_info        = os.path.join(self.output_folder, "tripinfo.out.xml")
+        statistic_output = os.path.join(self.output_folder, "statistic_output.xml")
+        summary          = os.path.join(self.output_folder, "summary.txt")
+        queue_output     = os.path.join(self.output_folder, "queue_output.xml")
+
+        if not os.path.exists(scenario_glb_dir):
+            logger.warning(f"[EVAL] 3D assets dir not found: {scenario_glb_dir}")
+
+        tls_add = [
+            os.path.join(_PROJECT_ROOT, "data", "raw", self.scenario_name, "add", "e2.add.xml"),
+            os.path.join(_PROJECT_ROOT, "data", "raw", self.scenario_name, "add", "tls_programs.add.xml"),
+        ]
+
+        env_tshub_cfg = copy.deepcopy(TSHUB_ENV_CONFIG)
+        if self.sumo_seed is not None:
+            env_tshub_cfg["sumo_seed"] = self.sumo_seed
+
+        self.env_params = {
+            'tls_id':           self.junction_name,
+            'number_phases':    self.scenario_config["PHASE_NUMBER"],
+            'sumo_cfg':         sumo_cfg,
+            'scenario_glb_dir': scenario_glb_dir,
+            'trip_info':        trip_info,
+            'statistic_output': statistic_output,
+            'summary':          summary,
+            'queue_output':     queue_output,
+            'tls_state_add':    tls_add,
+            'renderer_cfg':     self.scenario_config.get("RENDERER_CFG"),
+            'sensor_cfg':       self.scenario_config.get("SENSOR_CFG"),
+            'tshub_env_cfg':    env_tshub_cfg,
+        }
+
+        # MaxPressure / FixedTime / Random 不需要图像，禁用 3D 渲染节省资源
+        if self.use_max_pressure:
+            logger.info("[EVAL] MaxPressure mode: disabling 3D rendering.")
+            mp_cfg = copy.deepcopy(self.env_params.get('renderer_cfg') or {})
+            mp_cfg['is_render'] = False
+            self.env_params['renderer_cfg'] = mp_cfg
+            self.env_params['sensor_cfg'] = None
+        elif self.use_random:
+            logger.info("[EVAL] Random mode: disabling 3D rendering.")
+            rand_cfg = copy.deepcopy(self.env_params.get('renderer_cfg') or {})
+            rand_cfg['is_render'] = False
+            self.env_params['renderer_cfg'] = rand_cfg
+            self.env_params['sensor_cfg'] = None
+        elif self.use_fixed_time:
+            logger.info("[EVAL] FixedTime mode: disabling 3D rendering.")
+            ft_cfg = copy.deepcopy(self.env_params.get('renderer_cfg') or {})
+            ft_cfg['is_render'] = False
+            self.env_params['renderer_cfg'] = ft_cfg
+            self.env_params['sensor_cfg'] = None
+
+        # 本场景的进口道方向列表（T字路口等非标准路口可能少于4个方向）
+        self.approach_dirs = self.scenario_config.get("APPROACH_DIRS", ['N', 'E', 'S', 'W'])
+        logger.info(f"[EVAL] Approach directions: {self.approach_dirs}")
+        self._write_eval_metadata()
+
+    def _write_eval_metadata(self):
+        metadata = {
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "scenario_key": self.scenario_key,
+            "scenario_name": self.scenario_name,
+            "route_file": self.route_file,
+            "route_stem": self.route_stem,
+            "scene_type": self.scene_type,
+            "event_bulletin_mode": self.event_bulletin_mode,
+            "event_bulletin_enabled": self.enable_event_bulletin,
+            "robust_perturb": self.robust_perturb,
+            "robust_level": self.robust_level,
+            "robust_enabled": self.robust_enabled,
+            "model_name": self.model_name,
+            "base_model_name": self.base_model_name,
+            "inference_model_name": self.model_name_override,
+            "result_name": self.result_name,
+            "sumo_seed": self.sumo_seed,
+            "seed_suffix": self.seed_suffix,
+            "output_folder": self.output_folder,
+            "log_root_path": self.logger_root_path,
+            "log_path": self.logger_path,
+            "use_fixed_time": self.use_fixed_time,
+            "use_max_pressure": self.use_max_pressure,
+            "use_random": self.use_random,
+            "warm_up_time": self.warm_up_time,
+            "fixed_time_green_duration": FIXED_TIME_GREEN_DURATION
+            if (self.use_fixed_time or self.use_max_pressure)
+            else None,
+            "api_url": self.api_url,
+            "temperature": self.temperature,
+            "max_new_tokens": self.max_new_tokens,
+            "prompt_builder": self.prompt_builder_source,
+            "duration_candidates": self.duration_candidates,
+            "prompt_saved_in_response_txt": not (
+                self.use_fixed_time or self.use_max_pressure or self.use_random
+            ),
+        }
+        save_to_json(metadata, os.path.join(self.output_folder, "eval_metadata.json"))
+
+        self._log_configurations()
+
+        # --- 2. 初始化仿真环境 ---
+        try:
+            logger.info(f"[EVAL] Initializing environment: {self.scenario_name} ...")
+            self.env = make_env(**self.env_params)()
+        except Exception as e:
+            logger.critical(f"[EVAL] Failed to create environment: {e}")
+            raise
+
+        # --- 3. 初始化 VLM Agent ---
+        if self.use_max_pressure or self.use_fixed_time or self.use_random:
+            if self.use_max_pressure:
+                baseline_mode = "MaxPressure"
+            elif self.use_fixed_time:
+                baseline_mode = "FixedTime"
+            else:
+                baseline_mode = "Random"
+            logger.info(
+                f"[EVAL] Running in {baseline_mode} mode. VLM skipped."
+            )
+            self.agent = None
+        else:
+            try:
+                logger.info("[EVAL] Initializing VLM Agent...")
+                agent_kwargs = {}
+                if self.api_url:
+                    agent_kwargs["url"] = self.api_url
+                if self.model_name_override:
+                    agent_kwargs["model_name"] = self.model_name_override
+                if self.temperature is not None:
+                    agent_kwargs["temperature"] = self.temperature
+                if self.max_new_tokens is not None:
+                    agent_kwargs["max_new_tokens"] = self.max_new_tokens
+                self.agent = VLMAgent(batch_size=self.batch_size, **agent_kwargs)
+            except Exception as e:
+                logger.critical(f"[EVAL] Failed to initialize VLM Agent: {e}")
+                raise
+
+        # 上下游协同广播板（拓扑由场景配置静态注入）
+        topology = self.scenario_config.get("TOPOLOGY", {}) if self.enable_event_bulletin else {}
+        self.bulletin = EventBulletin(topology=topology)
+
+    def __del__(self):
+        if hasattr(self, 'env') and self.env is not None:
+            try:
+                self.env.close()
+            except (Exception, SystemExit):
+                pass
+
+    def _log_configurations(self):
+        logger.info(f"[CFG] === Scenario ({self.scenario_key}) ===")
+        logger.info(f"[CFG] {json.dumps(self.scenario_config, indent=2, sort_keys=True, default=str)}")
+        logger.info(f"[CFG] === Env Params ===")
+        logger.info(f"[CFG] {json.dumps(self.env_params, indent=2, sort_keys=True, default=str)}")
+        logger.info(f"[CFG] === Model Config ===")
+        logger.info(f"[CFG] {json.dumps(MODEL_CONFIG, indent=2, sort_keys=True, default=str)}")
+        logger.info("[CFG] ==========================================")
+
+    def _collect_images(self, jid: str, sensor_imgs: dict, step_dir: str,
+                        approach_dirs: List[str]) -> List[str]:
+        """采集路口 jid 的进口道图像，按 approach_dirs 指定的方向各采集一张。
+
+        常规时保存 {element_id}.png（原始相机画面）。
+        开启视觉鲁棒性扰动时额外保存 {element_id}_perturbed.png，
+        并以扰动图像作为模型输入。
+
+        返回已成功保存的图像路径列表，顺序与 approach_dirs 一致；
+        若全部方向均无图像数据则返回空列表。
+        """
+        image_paths = []
+
+        for d in approach_dirs:
+            element_id = f'{jid}_{d}'
+            img_data = None
+            if element_id in sensor_imgs:
+                img_data = sensor_imgs[element_id].get('junction_front_all')
+
+            if img_data is not None:
+                img_path = os.path.join(step_dir, f"{element_id}.png")
+
+                try:
+                    if self.robust_enabled:
+                        # 鲁棒性实验：先保存原始图，再施加扰动作为模型输入
+                        cv2.imwrite(img_path, convert_rgb_to_bgr(img_data))
+                        perturb_seed = f"{self.sumo_seed}_{element_id}_{os.path.basename(step_dir)}"
+                        perturbed_rgb = apply_visual_perturbation(
+                            img_data,
+                            perturb_type=self.robust_perturb,
+                            level=self.robust_level,
+                            seed=perturb_seed,
+                        )
+                        img_path_perturbed = os.path.join(step_dir, f"{element_id}_perturbed.png")
+                        cv2.imwrite(img_path_perturbed, convert_rgb_to_bgr(perturbed_rgb))
+                        image_paths.append(img_path_perturbed)
+                    else:
+                        cv2.imwrite(img_path, convert_rgb_to_bgr(img_data))
+                        image_paths.append(img_path)
+                    logger.debug(f"[EVAL] 图像已保存: {img_path}")
+                except Exception as e:
+                    logger.warning(f"[EVAL] 图像保存失败 {element_id}: {e}")
+            else:
+                logger.debug(f"[EVAL] 无图像数据: {element_id}")
+
+        return image_paths
+
+    @staticmethod
+    def _parse_phase_duration(vlm_resp: str):
+        """从 VLM 响应中解析 (phase_id, green_duration) 二元组。
+
+        支持格式：
+          Action: {"phase": 1, "duration": 25}
+          Action: { "phase": 1, "duration": 25 }
+          Action: phase=1, duration=25
+          Action: phase: 1, duration: 25
+        兼容旧格式：Action: 1（duration 默认取候选集中心值）
+        返回 (int, int) 或 None（解析失败）。
+        """
+        if not vlm_resp or vlm_resp == "ERROR":
+            return None
+
+        default_duration = GREEN_DURATION_CANDIDATES[len(GREEN_DURATION_CANDIDATES) // 2]
+        action_match = re.search(r"Action\s*:\s*(.+)", vlm_resp, re.IGNORECASE | re.DOTALL)
+        search_text = action_match.group(1).strip() if action_match else vlm_resp
+
+        patterns = [
+            r'"phase"\s*:\s*(\d+)\D+"duration"\s*:\s*(\d+)',
+            r"'phase'\s*:\s*(\d+)\D+'duration'\s*:\s*(\d+)",
+            r"phase\s*=\s*(\d+)\D+duration\s*=\s*(\d+)",
+            r"phase\s*:\s*(\d+)\D+duration\s*:\s*(\d+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, search_text, re.IGNORECASE | re.DOTALL)
+            if match:
+                return int(match.group(1)), int(match.group(2))
+
+        phase_match = re.search(r'["\']?phase["\']?\s*[:=]\s*(\d+)', search_text, re.IGNORECASE)
+        duration_match = re.search(r'["\']?duration["\']?\s*[:=]\s*(\d+)', search_text, re.IGNORECASE)
+        if phase_match and duration_match:
+            return int(phase_match.group(1)), int(duration_match.group(1))
+
+        match_legacy = re.search(r"^\[?(\d+)\]?\s*$", search_text, re.IGNORECASE)
+        if not match_legacy:
+            match_legacy = re.search(r"Action:?\s*\[?(\d+)\]?", vlm_resp, re.IGNORECASE)
+        if match_legacy:
+            return int(match_legacy.group(1)), default_duration
+        return None
+
+    @staticmethod
+    def _apply_max_pressure_action(jid: str, render_json: dict, last_action: Dict[str, dict]) -> bool:
+        """基于当前队列压力，为单个路口生成 MaxPressure 动作。"""
+        tls_state     = render_json.get('tls', {}).get(jid, {})
+        movement_ids  = tls_state.get('movement_ids', [])
+        jam_veh       = tls_state.get('jam_length_vehicle', [])
+        phase2mov     = tls_state.get('phase2movements', {})
+        if movement_ids and jam_veh and phase2mov:
+            mov_q = {mid: ql for mid, ql in zip(movement_ids, jam_veh)}
+            pressure = {
+                ph: sum(mov_q.get(mid, 0) for mid in mvs)
+                for ph, mvs in phase2mov.items()
+            }
+            mp_phase = max(pressure, key=pressure.get)
+            last_action[jid] = {'phase_id': mp_phase, 'duration': FIXED_TIME_GREEN_DURATION}
+            logger.info(
+                f"[MaxPressure] {jid} | pressure={pressure} | "
+                f"phase={mp_phase} | dur={FIXED_TIME_GREEN_DURATION}s"
+            )
+            return True
+
+        logger.warning(f"[MaxPressure] {jid}: 数据缺失，沿用上次动作")
+        return False
+
+    def run_eval(self, max_sumo_seconds: int = 3600):
+        """
+        异步决策评测主循环。
+
+        运行逻辑：
+          1. env.step() 返回时，由 tsc_wrapper 保证至少一个路口 can_perform_action=True
+          2. 从 render_json 中读取各路口 can_perform_action，确定 deciding_jids
+          3. 仅对 deciding_jids 渲染图像、构建 Prompt、执行 VLM 推理
+          4. 非决策路口的 last_action 保持不变，由 TransSimHub 内部处理相位计时
+          5. 以 SUMO 仿真时间（秒）为终止条件
+        """
+        logger.info(
+            f"[EVAL] 异步评测启动 | output={self.output_folder} | "
+            f"max_sumo={max_sumo_seconds}s | warm_up_time={self.warm_up_time}"
+        )
+
+        obs, _ = self.env.reset()
+        dones, truncated = False, False
+        sumo_sim_step = 0.0
+        wall_time_start = time.time()
+
+        junctions = (
+            self.junction_name if isinstance(self.junction_name, list)
+            else [self.junction_name]
+        )
+        is_multi_agent = isinstance(self.junction_name, list)
+        num_phases = self.scenario_config.get("PHASE_NUMBER", 4)
+
+        # 各路口上一次执行的动作；非决策路口沿用此值
+        last_action: Dict[str, dict] = {
+            jid: {'phase_id': 0, 'duration': FIXED_TIME_GREEN_DURATION}
+            for jid in junctions
+        }
+
+        # 热身步：推进仿真获取初始状态与图像
+        logger.info("[EVAL] 执行热身步...")
+        init_action = {jid: 0 for jid in junctions} if is_multi_agent else 0
+        try:
+            obs, rewards, truncated, dones, infos, render_json = self.env.step(
+                init_action,
+                compute_reward=False,
+            )
+            sumo_sim_step = float(infos.get('step_time', 0))
+        except Exception as e:
+            logger.critical(f"[EVAL] 热身步失败: {e}")
+            return
+
+        # ── 主循环 ────────────────────────────────────────────────────────────
+        while not (dones or truncated) and sumo_sim_step < max_sumo_seconds:
+
+            # 清理过期事件通知（基于 SUMO 时间）；常规场景不启用事件协同。
+            if self.enable_event_bulletin:
+                self.bulletin.tick(sumo_sim_step)
+
+            sensor_datas = infos.get('3d_data', {})
+            sensor_imgs  = sensor_datas.get('image', {})
+
+            # 确定本轮需要决策的路口（can_perform_action=True）
+            if is_multi_agent:
+                deciding_jids = [
+                    jid for jid in junctions
+                    if render_json.get('tls', {}).get(jid, {}).get('can_perform_action', False)
+                ]
+            else:
+                deciding_jids = junctions
+
+            if not deciding_jids:
+                # 理论上 tsc_wrapper 已保证至少一个，此处为防御性处理
+                logger.warning(
+                    f"[EVAL] sumo_t={sumo_sim_step:.0f}s: 无路口需要决策，直接推进仿真"
+                )
+            else:
+                logger.info(
+                    f"[EVAL] ══════ sumo_t={sumo_sim_step:.0f}s | "
+                    f"决策路口 ({len(deciding_jids)}/{len(junctions)}): "
+                    f"{deciding_jids} ══════"
+                )
+
+            # VLM 模式下的推理任务队列（批量收集后统一推理）
+            inference_tasks = []
+            warm_up_active = (
+                self.warm_up_time is not None
+                and self.warm_up_time > 0
+                and sumo_sim_step < self.warm_up_time
+            )
+
+            for jid in deciding_jids:
+                # 图像目录：{output_folder}/{jid}/{sumo_step}/
+                jid_step_dir = os.path.join(self.output_folder, jid, f"{int(sumo_sim_step)}")
+                os.makedirs(jid_step_dir, exist_ok=True)
+
+                if warm_up_active:
+                    self._apply_max_pressure_action(jid, render_json, last_action)
+                    logger.info(
+                        f"[WarmUp][MaxPressure] {jid} | t={sumo_sim_step:.0f}s | "
+                        f"using MaxPressure until warm_up_time={self.warm_up_time}s"
+                    )
+                    continue
+
+                # ── MaxPressure ──
+                if self.use_max_pressure:
+                    self._apply_max_pressure_action(jid, render_json, last_action)
+                    continue
+
+                # ── FixedTime ──
+                if self.use_fixed_time:
+                    cur_phase = render_json.get('tls', {}).get(jid, {}).get('this_phase_index', 0)
+                    next_phase = (cur_phase + 1) % num_phases
+                    last_action[jid] = {'phase_id': next_phase, 'duration': FIXED_TIME_GREEN_DURATION}
+                    logger.info(
+                        f"[FixedTime] {jid} | phase={next_phase} | dur={FIXED_TIME_GREEN_DURATION}s"
+                    )
+                    continue
+
+                # ── Random ──
+                if self.use_random:
+                    rand_phase = random.randrange(num_phases)
+                    rand_duration = random.choice(GREEN_DURATION_CANDIDATES)
+                    last_action[jid] = {'phase_id': rand_phase, 'duration': rand_duration}
+                    logger.info(
+                        f"[Random] {jid} | phase={rand_phase} | dur={rand_duration}s"
+                    )
+                    continue
+
+                # ── VLM 模式 ──
+                cur_phase = render_json.get('tls', {}).get(jid, {}).get('this_phase_index', 0)
+                coord_ctx = (
+                    self.bulletin.get_context(jid, sumo_sim_step)
+                    if self.enable_event_bulletin
+                    else ""
+                )
+                if coord_ctx:
+                    logger.info(
+                        f"[Bulletin][注入] {jid} | sumo_t={sumo_sim_step:.0f}s | 注入上游协同通知"
+                    )
+
+                image_paths = self._collect_images(
+                    jid, sensor_imgs, jid_step_dir, self.approach_dirs
+                )
+                if image_paths:
+                    prompt = self.PromptBuilder.build_decision_prompt(
+                        current_phase_id=cur_phase,
+                        scenario_name=self.scenario_key,
+                        neighbor_messages=coord_ctx,
+                    )
+                    inference_tasks.append((jid, image_paths, prompt, cur_phase, jid_step_dir))
+                else:
+                    logger.warning(f"[EVAL] {jid}: 无可用图像，沿用上次动作")
+
+            # ── Batch VLM 推理 ──
+            if inference_tasks:
+                for i in range(0, len(inference_tasks), self.batch_size):
+                    batch      = inference_tasks[i:i + self.batch_size]
+                    b_jids     = [t[0] for t in batch]
+                    b_imgs     = [t[1] for t in batch]
+                    b_prompts  = [t[2] for t in batch]
+                    b_cur_phs  = [t[3] for t in batch]
+                    b_dirs     = [t[4] for t in batch]
+
+                    results = self.agent.get_batch_decision(b_imgs, b_prompts)
+
+                    for jid, step_dir, cur_phase, prompt, (vlm_resp, latency, parsed_action, thought) in zip(
+                        b_jids, b_dirs, b_cur_phs, b_prompts, results
+                    ):
+                        # 保存 VLM 响应文本
+                        gt_counts = {}
+                        if 'bev_lane_vehicle_counts' in sensor_datas:
+                            gt_counts = sensor_datas['bev_lane_vehicle_counts'].get(
+                                f'aircraft_{jid}', {}
+                            )
+                        resp_content = f"[User Prompt]\n{prompt}\n\n[Model Response]\n{vlm_resp}"
+                        if thought:
+                            resp_content += f"\n\n[Thinking Process]\n{thought}"
+                        write_response_to_file(
+                            file_path=os.path.join(step_dir, "response.txt"),
+                            content=resp_content
+                        )
+
+                        # 采集并保存当前路口 GT（lane_level_gt + event_gt）
+                        try:
+                            sumo_conn = self.env.unwrapped.tsc_env.tshub_env.sumo
+                            gt_payload = collect_ground_truth(sumo_conn, self.scenario_key, jid)
+                        except Exception as _gt_exc:
+                            logger.debug(f"[EVAL] GT 采集失败 {jid}@{sumo_sim_step}: {_gt_exc}")
+                            gt_payload = {"lane_level_gt": {}, "event_gt": []}
+                        save_to_json(gt_payload, os.path.join(step_dir, "gt.json"))
+
+                        # 解析并校验动作
+                        if parsed_action is not None:
+                            p_id, raw_dur = parsed_action
+                            parsed = parsed_action
+                            if not 0 <= p_id < num_phases:
+                                logger.warning(
+                                    f"[VLM] {jid} | 非法 phase_id={p_id}，"
+                                    f"合法范围应为 [0, {num_phases - 1}]，本轮降级为 FixedTime"
+                                )
+                                parsed = None
+                            else:
+                                actual_dur = min(
+                                    self.duration_candidates,
+                                    key=lambda x: abs(x - raw_dur)
+                                )
+                                if raw_dur not in self.duration_candidates:
+                                    logger.warning(
+                                        f"[VLM] {jid} | VLM输出时长 {raw_dur}s 不在候选集 "
+                                        f"{self.duration_candidates}，已吸附至 {actual_dur}s"
+                                    )
+                                # 防御性校验：确保吸附结果合法
+                                assert actual_dur in self.duration_candidates, \
+                                    f"吸附后时长 {actual_dur}s 仍不在候选集"
+                                last_action[jid] = {'phase_id': p_id, 'duration': actual_dur}
+                                logger.info(
+                                    f"[VLM] {jid} | phase={p_id} | duration={actual_dur}s | "
+                                    f"latency={latency:.2f}s | sumo_t={sumo_sim_step:.0f}s"
+                                )
+                                # 广播事件通知给邻居路口
+                                if self.enable_event_bulletin and is_multi_agent:
+                                    self.bulletin.broadcast(
+                                        from_jid=jid,
+                                        vlm_response=vlm_resp,
+                                        green_duration=actual_dur,
+                                        current_sumo_step=sumo_sim_step,
+                                    )
+                        else:
+                            parsed = None
+
+                        if parsed is None:
+                            next_phase = (cur_phase + 1) % num_phases
+                            last_action[jid] = {'phase_id': next_phase, 'duration': FIXED_TIME_GREEN_DURATION}
+                            logger.warning(
+                                f"[EVAL] VLM解析失败 | {jid} | "
+                                f"resp={str(vlm_resp)[:80]} | 降级为 FixedTime (phase={next_phase}, duration={FIXED_TIME_GREEN_DURATION}s)"
+                            )
+
+            # 保存本轮 render_json
+            if deciding_jids:
+                render_dir = os.path.join(self.output_folder, "render_info")
+                os.makedirs(render_dir, exist_ok=True)
+                save_to_json(render_json, os.path.join(render_dir, f'render_{int(sumo_sim_step)}.json'))
+
+            # ── 推进仿真（传全量 last_action，非决策路口动作由 TransSimHub 忽略）──
+            final_action = last_action if is_multi_agent else last_action.get(self.junction_name, 0)
+            try:
+                obs, rewards, truncated, dones, infos, render_json = self.env.step(
+                    final_action,
+                    compute_reward=False,
+                )
+                sumo_sim_step = float(infos.get('step_time', sumo_sim_step))
+            except Exception as e:
+                logger.error(f"[EVAL] env.step 失败 @ sumo_t={sumo_sim_step:.0f}s: {e}")
+                break
+
+        # ── 评测结束 ──
+        if self.enable_event_bulletin and is_multi_agent:
+            self.bulletin.log_topology()
+
+        wall_elapsed = time.time() - wall_time_start
+        logger.info(
+            f"[EVAL] 评测完成 | 耗时={wall_elapsed:.1f}s | "
+            f"最终 SUMO 时间={sumo_sim_step:.0f}s | "
+            f"结束原因={'done/truncated' if (dones or truncated) else 'max_sumo_reached'}"
+        )
+
+        if hasattr(self, 'temp_cfg_path') and os.path.exists(self.temp_cfg_path):
+            try:
+                os.remove(self.temp_cfg_path)
+                logger.info(f"[EVAL] 已删除临时配置: {self.temp_cfg_path}")
+            except OSError as e:
+                logger.warning(f"[EVAL] 删除临时配置失败: {e}")
+
+        self.env.close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="交通信号控制评测主入口（异步决策，支持 VLM / FixedTime / MaxPressure / Random）"
+    )
+    parser.add_argument("--scenario",    "-sc", type=str, default="JiNan",
+                        help="场景键名 (e.g., JiNan, Hangzhou, Hongkong_YMT, SouthKorea_Songdo, France_Massy)")
+    parser.add_argument("--log_dir",     "-l",  type=str, default="./log/eval_results",
+                        help="日志输出目录")
+    parser.add_argument("--route_file",  "-r",  type=str, default="data/raw/JiNan/env/anon_3_4_jinan_real_emergy_bus.rou.xml",
+                        help=".rou.xml 路由文件名（SUMO 将在 env/ 下查找）")
+    parser.add_argument("--max_sumo_seconds",   "-n",  type=int, default=30,
+                        help="最大 SUMO 仿真时间（秒），默认 3600s = 1 小时")
+    parser.add_argument("--scene_type",  "-st", type=str, default="normal",
+                        choices=VALID_SCENE_TYPES,
+                        help="场景类型（default: normal）")
+    parser.add_argument("--warm_up_time", type=int, default=None,
+                        help="前 N 秒强制使用 MaxPressure；默认不启用")
+
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--fixed_time",   action="store_true", help="固定配时基线")
+    mode_group.add_argument("--max_pressure", action="store_true", help="MaxPressure 基线")
+    mode_group.add_argument("--random",       action="store_true", help="随机相位与时长基线")
+
+    parser.add_argument("--api_url",    type=str, default="http://localhost:8000/v1/chat/completions", help="覆盖 model_config 中的 api_url")
+    parser.add_argument("--model_name", type=str, default="qwen3-vl-8b", help="覆盖 model_config 中的 model_name")
+    parser.add_argument("--result_name", type=str, default=None,
+                        help="覆盖结果目录中的方法名；默认沿用 --model_name")
+    parser.add_argument("--temperature", type=float, default=0,
+                        help="覆盖 model_config 中的 temperature（如推理用 0）")
+    parser.add_argument("--max_new_tokens", type=int, default=None,
+                        help="覆盖 model_config 中的 max_new_tokens")
+    parser.add_argument("--gpu_id", type=str, default=None,
+                        help="限制当前评测进程使用的 GPU 编号，如 0 或 1；同时影响 EGL 渲染与本地 CUDA 模型")
+    parser.add_argument("--sumo_seed", type=str, default=None,
+                        help="覆盖 SUMO 随机种子；例如 12。未指定时使用 configs/env_config.py 中的默认值")
+    parser.add_argument("--prompt_builder", type=str, default="configs.prompt_builder",
+                        help="PromptBuilder 模块名或 .py 文件路径，默认 configs.prompt_builder")
+    parser.add_argument("--event_bulletin", type=str, default="auto",
+                        choices=["auto", "on", "off"],
+                        help="EventBulletin 开关：auto=仅 accident_debris 开启，on=强制开启，off=强制关闭")
+    parser.add_argument("--robust_perturb", type=str, default="none",
+                        choices=["none", *VALID_PERTURB_TYPES],
+                        help="视觉鲁棒性扰动类型：none=关闭，occlusion=部分遮挡，"
+                             "noise=高斯噪声，lowres=低分辨率（仅 VLM 模式生效）")
+    parser.add_argument("--robust_level", type=str, default="medium",
+                        choices=list(VALID_LEVELS),
+                        help="视觉鲁棒性扰动强度档位：light / medium / heavy（默认 medium）")
+
+    args = parser.parse_args()
+    # 必须在 Evaluator 初始化前执行。
+    # 原因是 Evaluator 内部会：
+    #   1. 创建 3D 仿真与渲染环境；
+    #   2. 在需要时加载本地 VLM 模型。
+    # 如果在这些步骤之后才设置 CUDA/EGL 可见设备，GPU 绑定可能已经来不及生效。
+    selected_gpu = configure_gpu_visibility(args.gpu_id)
+    if selected_gpu is not None:
+        logger.info(
+            f"[EVAL] GPU visibility configured before env/model init: "
+            f"CUDA_VISIBLE_DEVICES={selected_gpu}"
+        )
+
+    evaluator = Evaluator(
+        scenario_key=args.scenario,
+        log_dir=args.log_dir,
+        route_file=args.route_file,
+        use_fixed_time=args.fixed_time,
+        use_max_pressure=args.max_pressure,
+        use_random=args.random,
+        warm_up_time=args.warm_up_time,
+        api_url=args.api_url,
+        model_name_override=args.model_name,
+        result_name=args.result_name,
+        scene_type=args.scene_type,
+        temperature=args.temperature,
+        max_new_tokens=args.max_new_tokens,
+        sumo_seed=args.sumo_seed,
+        prompt_builder=args.prompt_builder,
+        event_bulletin=args.event_bulletin,
+        robust_perturb=args.robust_perturb,
+        robust_level=args.robust_level,
+    )
+    evaluator.run_eval(max_sumo_seconds=args.max_sumo_seconds)

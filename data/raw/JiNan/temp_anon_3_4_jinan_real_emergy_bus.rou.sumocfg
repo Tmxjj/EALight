@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+	<input>
+		<net-file value="./env/jinan.net.xml"/>
+		<route-files value="./env/anon_3_4_jinan_real_emergy_bus.rou.xml"/>
+		<additional-files value="./add/e2.add.xml, ./add/tls_programs.add.xml"/>
+	</input>
+	<time>
+		<begin value="0"/>
+		<end value="3600"/>
+	</time>
+</configuration>

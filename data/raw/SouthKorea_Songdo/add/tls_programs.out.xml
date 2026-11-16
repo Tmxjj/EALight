@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- generated on 2026-05-26T01:30:38.708186+08:00 by Eclipse SUMO libsumo 1.27.0
+<libsumoConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/libsumoConfiguration.xsd">
+
+    <input>
+        <net-file value="/home/jyf/code/trafficVLM/code/VLMTraffic/EALight/data/raw/SouthKorea_Songdo/./env/songdo.net.xml"/>
+        <route-files value="/home/jyf/code/trafficVLM/code/VLMTraffic/EALight/data/raw/SouthKorea_Songdo/./env/songdo_emergy_bus.rou.xml"/>
+        <additional-files value="/home/jyf/code/trafficVLM/code/VLMTraffic/EALight/data/raw/SouthKorea_Songdo/add/e2.add.xml,/home/jyf/code/trafficVLM/code/VLMTraffic/EALight/data/raw/SouthKorea_Songdo/add/tls_programs.add.xml"/>
+    </input>
+
+    <output>
+        <queue-output value="/home/jyf/code/trafficVLM/code/VLMTraffic/EALight/data/eval/SouthKorea_Songdo/songdo_emergy_bus/ealight-8b_seed_42/queue_output.xml"/>
+        <summary-output value="/home/jyf/code/trafficVLM/code/VLMTraffic/EALight/data/eval/SouthKorea_Songdo/songdo_emergy_bus/ealight-8b_seed_42/summary.txt"/>
+        <tripinfo-output value="/home/jyf/code/trafficVLM/code/VLMTraffic/EALight/data/eval/SouthKorea_Songdo/songdo_emergy_bus/ealight-8b_seed_42/tripinfo.out.xml"/>
+        <tripinfo-output.write-unfinished value="true"/>
+        <statistic-output value="/home/jyf/code/trafficVLM/code/VLMTraffic/EALight/data/eval/SouthKorea_Songdo/songdo_emergy_bus/ealight-8b_seed_42/statistic_output.xml"/>
+    </output>
+
+    <processing>
+        <time-to-teleport value="-1"/>
+        <waiting-time-memory value="10000"/>
+        <max-depart-delay value="100000"/>
+    </processing>
+
+    <report>
+        <no-warnings value="true"/>
+        <no-step-log value="true"/>
+    </report>
+
+    <emissions>
+        <device.emissions.probability value="1.0"/>
+    </emissions>
+
+</libsumoConfiguration>

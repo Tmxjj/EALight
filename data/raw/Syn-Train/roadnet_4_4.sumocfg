@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+	<input>
+		<net-file value="./env/roadnet_4_4.net.xml"/>
+		<route-files value="./env/anon_4_4_synthetic_8000.rou.xml"/>
+		<additional-files value="./add/e2.add.xml,./add/tls_programs.add.xml"/>
+	</input>
+	<time>
+		<begin value="0"/>
+		<end value="3600"/>
+	</time>
+</configuration>

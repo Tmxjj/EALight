@@ -1,0 +1,23 @@
+============================================================
+  EmgBus Generation Summary — anon_4_4_synthetic_8000_emergy_bus.rou
+  Generated: 2026-05-07 15:46:24
+============================================================
+
+[Parameters]
+  input                          = data/raw/Syn-Train/env/anon_4_4_synthetic_8000.rou.xml
+  output                         = data/raw/Syn-Train/env/anon_4_4_synthetic_8000_emergy_bus.rou.xml
+  emergency_ratio                = 0.005
+  bus_ratio                      = 0.01
+  seed                           = 42
+
+[Statistics]
+  total_vehicles                 = 8000
+  n_emergency                    = 40
+  n_bus                          = 80
+  max_depart_s                   = 3598.0
+  type_school_bus                = 40
+  type_fire_engine               = 13
+  type_bus                       = 40
+  type_emergency                 = 14
+  type_police                    = 13
+

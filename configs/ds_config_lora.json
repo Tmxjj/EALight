@@ -1,0 +1,27 @@
+{
+  "train_micro_batch_size_per_gpu": "auto",
+  "train_batch_size": "auto",
+  "gradient_accumulation_steps": "auto",
+  "gradient_clipping": 1.0,
+
+  "bf16": {
+    "enabled": "auto"
+  },
+
+  "zero_optimization": {
+    "stage": 2,
+    "overlap_comm": false,
+    "reduce_bucket_size": 500000000,
+    "allgather_bucket_size": 500000000,
+    "contiguous_gradients": true,
+    "offload_optimizer": {
+      "device": "none"
+    },
+    "offload_param": {
+      "device": "none"
+    }
+  },
+
+  "steps_per_print": 100,
+  "wall_clock_breakdown": false
+}

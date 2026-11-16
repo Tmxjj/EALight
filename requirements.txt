@@ -1,0 +1,45 @@
+# ==========================================
+# 🚗 交通仿真与 3D 渲染 (SUMO & Panda3D)
+# ==========================================
+sumolib
+traci
+panda3d==1.10.14
+panda3d-simplepbr>=0.7.0  # 必须保证最新版，以支持关闭 HDR/ACES 滤镜
+PyOpenGL
+PyOpenGL_accelerate
+gymnasium
+shapely
+
+# ==========================================
+# 🧠 大语言模型与深度学习 (VLM / LLM)
+# ==========================================
+torch>=2.5.0,<2.7.0      # vllm==0.12.0 requires torch >=2.5; <2.7 guards against untested versions
+transformers==4.57.5
+vllm==0.12.0
+accelerate
+trl==0.13.0
+modelscope
+google-genai
+ninja
+deepspeed
+
+
+# ==========================================
+# 📊 视觉、数据处理与基础工具
+# ==========================================
+numpy
+pandas
+opencv-python     # 对应代码中的 import cv2
+pillow
+scikit-learn
+matplotlib
+tensorboard
+loguru            # 对应代码中的日志管理
+debugpy
+
+# ==========================================
+# 🛠️ 辅助工具与 UI
+# ==========================================
+tenacity
+deep-translator
+streamlit
