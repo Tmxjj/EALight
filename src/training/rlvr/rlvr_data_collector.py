@@ -6,7 +6,7 @@
 2. 把旧版 all_rollout_rewards 的"纯 float"格式兼容升级为统一的 dict schema。
 
 字段来源说明：
-- 1_golden_generation.py 产出字段：image_paths（非 images）、neighbor_messages、
+- 原始观测样本字段：image_paths（非 images）、neighbor_messages、
   scenario、junction_id、sumo_step、current_phase_id、num_phases、prompt、
   vlm_response、vlm_action、vlm_thought、best_action、best_reward、
   lane_level_gt、event_gt、controlled_lane_keys、all_rollout_rewards、label、
@@ -170,7 +170,7 @@ def _build_rlvr_sample(
 ) -> Optional[Dict[str, Any]]:
     """把单条原始样本整理成 RLVR 训练样本。
 
-    兼容 1_golden_generation.py（image_paths、neighbor_messages 等字段）与
+    兼容原始观测样本（image_paths、neighbor_messages 等字段）与
     SFT 产物（images 字段）两种来源格式。
 
     如果连 prompt / image 都没有，说明这条样本不是可训练样本，直接返回 None。

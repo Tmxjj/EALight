@@ -1,5 +1,7 @@
 # EALight: Event-Aware Traffic Signal Control via Vision-Language World Knowledge
 
+> Training / 训练说明：[guide](docs/training_and_evaluation.md) · [vision-only](src/vision_only_baseline/README.md).
+
 > **[中文说明见下方 / Chinese version below ↓](#中文说明)**
 
 ---
@@ -35,6 +37,7 @@ EALight/
 │   │   ├── vlm_agent.py        # VLM agent: prompt build + action parse
 │   │   ├── vllm_load_model.sh  # Start vLLM inference server
 │   │   └── vllm_load_model_lora.sh
+│   ├── vision_only_baseline/  # Vision-only model, training and evaluation scripts
 │   ├── training/
 │   │   ├── trainer.py          # SFT trainer
 │   │   ├── sft_trainer.sh
@@ -131,7 +134,7 @@ cd TransSimHub && pip install -e . && cd ..
 
 ### Step 4 — Prepare the model
 
-The fine-tuned **EALight-8B** model will be released publicly upon paper acceptance. For evaluation purposes, the base **Qwen3-VL-8B-Instruct** model can be used as a drop-in replacement to verify the evaluation pipeline. Complete training hyperparameters and scripts are provided in `src/training/` for full reproducibility.
+This repository provides EALight and vision-only training/evaluation scripts. Obtain the base **Qwen3-VL-8B-Instruct** model independently and train locally. The base model can validate the evaluation pipeline, but its results do not reproduce a trained EALight checkpoint. See [the training and evaluation guide](docs/training_and_evaluation.md) for data contracts and commands.
 
 ```bash
 # Download base model from ModelScope (recommended for users in China)
@@ -141,7 +144,7 @@ python scripts/download_model.py
 pip install huggingface_hub
 python -c "
 from huggingface_hub import snapshot_download
-snapshot_download('Qwen/Qwen3-VL-8B-Instruct', local_dir='models/qwen3-vl-8b')
+snapshot_download('Qwen/Qwen3-VL-8B-Instruct', local_dir='models/Qwen3-VL-8B-Instruct')
 "
 ```
 
@@ -174,10 +177,10 @@ bash src/inference/vllm_load_model.sh
 
 ```bash
 # Emergency vehicles + school/transit buses
-bash scripts/run_batch_event_eval.sh --event emergy_bus      --port 8000 --model_name ealight-8b
+bash scripts/run_batch_event_eval.sh --event emergy_bus      --port 8000 --model_name qwen3-vl-8b --result_name ealight
 
 # Traffic accidents + road debris / construction
-bash scripts/run_batch_event_eval.sh --event accident_debris --port 8000 --model_name ealight-8b
+bash scripts/run_batch_event_eval.sh --event accident_debris --port 8000 --model_name qwen3-vl-8b --result_name ealight
 ```
 
 **Step 3** — Collect and display results:
@@ -195,31 +198,30 @@ The script prints `ATT`, `AWT`, `sp-ATT`, `sp-AWT`, `MaxQL`, and `TCR` for each
 
 The batch script (`scripts/run_batch_event_eval.sh`) includes four datasets by default.
 To add datasets not in this package (Hangzhou, New York), place the data under `data/raw/`
-and uncomment the corresponding lines in the `NORMAL_ENTRIES` / `EVENT_ENTRIES` section.
+and uncomment the corresponding lines in the `EVENT_ENTRIES` section.
 
 ---
 
 ## Training
 
-> The steps below are for full training reproducibility.
+> Source and launch scripts are provided; trained checkpoints and annotated SFT/RLVR datasets must be prepared locally. See [the detailed guide](docs/training_and_evaluation.md) and [vision-only instructions](src/vision_only_baseline/README.md).
 
 ### Phase 1 — Supervised Fine-Tuning (SFT)
 
 ```bash
-# Edit src/training/sft_trainer.sh: set model_path, data_file, output_dir
+# Override MODEL_PATH, DATA_PATH and OUTPUT_DIR as needed
 bash src/training/sft_trainer.sh
 ```
 
-### Phase 2 — RLVR Training (Online GRPO with Dual Verifiable Rewards)
+### Phase 2 — RLVR Training (GRPO with Cached Rollout Rewards)
 
 ```bash
-# Step 1: Generate RLVR rollout data via SUMO simulation
-#         (uses Syn-Train synthetic network included in data/raw/Syn-Train/)
+# Step 1: Convert raw samples that already contain cached SUMO rollout rewards
 python src/training/rlvr/rlvr_data_collector.py \
     data/rlvr_dataset/training_pool.jsonl \
     data/rlvr_dataset/rlvr_train.jsonl
 
-# Step 2: Edit src/training/rlvr_trainer.sh: set model_path (SFT checkpoint), data_file
+# Step 2: Set MODEL_PATH to your SFT checkpoint and DATA_PATH to the converted data
 # Step 3: Launch training (4 × A100 80 GB recommended)
 bash src/training/rlvr_trainer.sh
 ```
@@ -266,8 +268,8 @@ bash src/training/rlvr_trainer.sh
 |------|-------------------|
 | `configs/model_config.py` | `requests.url` and `requests.model_name` for local vLLM; or API keys for Gemini / OpenAI |
 | `src/inference/vllm_load_model.sh` | `--model` path to the model checkpoint |
-| `src/training/sft_trainer.sh` | `model_path`, `data_file`, `output_dir` |
-| `src/training/rlvr_trainer.sh` | `model_path` (SFT checkpoint), `data_file`, `wandb_entity` |
+| `src/training/sft_trainer.sh` | `MODEL_PATH`, `DATA_PATH`, `OUTPUT_DIR` |
+| `src/training/rlvr_trainer.sh` | `MODEL_PATH` (SFT checkpoint), `DATA_PATH`, `REPORT_TO` |
 
 ---
 
@@ -316,6 +318,7 @@ EALight/
 │   │   ├── vlm_agent.py        # VLM agent：Prompt 构建 + 动作解析
 │   │   ├── vllm_load_model.sh  # 启动 vLLM 推理服务
 │   │   └── vllm_load_model_lora.sh
+│   ├── vision_only_baseline/  # Vision-only model, training and evaluation scripts
 │   ├── training/
 │   │   ├── trainer.py          # SFT 训练主程序
 │   │   ├── sft_trainer.sh      # SFT 启动脚本
@@ -413,7 +416,7 @@ cd TransSimHub && pip install -e . && cd ..
 
 ### 步骤 4 — 准备模型
 
-微调后的 **EALight-8B** 模型将在论文接受后公开发布。在此之前，评测人员可使用基础版 **Qwen3-VL-8B-Instruct** 模型作为替代，以验证评测流程的完整性。所有训练超参数与训练脚本均已在 `src/training/` 中提供，支持完整的训练复现。
+仓库提供 EALight 和 vision-only 的训练、评测代码及启动脚本，请自行获取 **Qwen3-VL-8B-Instruct** 基础模型并训练。基础模型可验证评测流程，但其结果不能代表已训练 EALight 的性能。数据要求和运行命令见[训练与评测指南](docs/training_and_evaluation.md)。
 
 ```bash
 # 从 ModelScope 下载基础模型（国内推荐）
@@ -423,7 +426,7 @@ python scripts/download_model.py
 pip install huggingface_hub
 python -c "
 from huggingface_hub import snapshot_download
-snapshot_download('Qwen/Qwen3-VL-8B-Instruct', local_dir='models/qwen3-vl-8b')
+snapshot_download('Qwen/Qwen3-VL-8B-Instruct', local_dir='models/Qwen3-VL-8B-Instruct')
 "
 ```
 
@@ -456,10 +459,10 @@ bash src/inference/vllm_load_model.sh
 
 ```bash
 # 紧急车辆 + 校车与公交
-bash scripts/run_batch_event_eval.sh --event emergy_bus      --port 8000 --model_name ealight-8b
+bash scripts/run_batch_event_eval.sh --event emergy_bus      --port 8000 --model_name qwen3-vl-8b --result_name ealight
 
 # 交通事故 + 路面碎片/施工占道
-bash scripts/run_batch_event_eval.sh --event accident_debris --port 8000 --model_name ealight-8b
+bash scripts/run_batch_event_eval.sh --event accident_debris --port 8000 --model_name qwen3-vl-8b --result_name ealight
 ```
 
 **第 3 步** — 汇总结果：
@@ -475,31 +478,30 @@ python src/evaluation/metrics.py
 
 评测脚本 `scripts/run_batch_event_eval.sh` 默认激活 4 个包内数据集。
 如需加入 Hangzhou、New York 等未包含的数据集，请将数据放至 `data/raw/` 对应目录，
-然后取消脚本中 `NORMAL_ENTRIES` / `EVENT_ENTRIES` 相关行的注释即可。
+然后取消脚本中 `EVENT_ENTRIES` 相关行的注释即可。
 
 ---
 
 ## 训练
 
-> 如需完整复现训练流程，参考以下步骤。
+> 训练权重和标注数据需自行准备，详见[训练与评测指南](docs/training_and_evaluation.md)及[纯视觉基线说明](src/vision_only_baseline/README.md)。
 
 ### 阶段 1 — 监督微调（SFT）
 
 ```bash
-# 编辑 src/training/sft_trainer.sh：配置 model_path、data_file、output_dir
+# 按需通过环境变量配置 MODEL_PATH、DATA_PATH、OUTPUT_DIR
 bash src/training/sft_trainer.sh
 ```
 
-### 阶段 2 — RLVR 训练（在线 GRPO + 双路可验证奖励）
+### 阶段 2 — RLVR 训练（GRPO + 缓存 rollout 奖励）
 
 ```bash
-# 第 1 步：通过 SUMO 仿真生成 RLVR rollout 数据
-#          使用 data/raw/Syn-Train/ 中的合成路网
+# 第 1 步：转换已包含 SUMO rollout 缓存奖励的原始样本
 python src/training/rlvr/rlvr_data_collector.py \
     data/rlvr_dataset/training_pool.jsonl \
     data/rlvr_dataset/rlvr_train.jsonl
 
-# 第 2 步：编辑 src/training/rlvr_trainer.sh：配置 model_path（SFT checkpoint）、data_file
+# 第 2 步：通过 MODEL_PATH 指定自己的 SFT checkpoint，通过 DATA_PATH 指定数据
 # 第 3 步：启动训练（推荐 4 × A100 80 GB）
 bash src/training/rlvr_trainer.sh
 ```
@@ -546,8 +548,8 @@ bash src/training/rlvr_trainer.sh
 |------|-----------|
 | `configs/model_config.py` | 本地 vLLM 的 `requests.url` 和 `requests.model_name`；或 Gemini / OpenAI API Key |
 | `src/inference/vllm_load_model.sh` | `--model` 指向模型 checkpoint 路径 |
-| `src/training/sft_trainer.sh` | `model_path`、`data_file`、`output_dir` |
-| `src/training/rlvr_trainer.sh` | `model_path`（SFT checkpoint）、`data_file`、`wandb_entity` |
+| `src/training/sft_trainer.sh` | `MODEL_PATH`、`DATA_PATH`、`OUTPUT_DIR` |
+| `src/training/rlvr_trainer.sh` | `MODEL_PATH`（SFT checkpoint）、`DATA_PATH`、`REPORT_TO` |
 
 ---
 

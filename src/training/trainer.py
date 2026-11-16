@@ -1,6 +1,8 @@
 
 import argparse
 import os
+import sys
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,8 +11,11 @@ import torch
 import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import AutoConfig, AutoProcessor, Qwen3VLForConditionalGeneration
-from trl import DPOConfig, DPOTrainer, GRPOConfig, GRPOTrainer
+from trl import DPOConfig, DPOTrainer, SFTConfig, SFTTrainer
 from trl.trainer.dpo_trainer import DataCollatorForVisionPreference
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from src.training.sft_data import load_sft_dataset
 
 
 # ===========================================================================
@@ -273,7 +278,7 @@ def main():
     parser.add_argument("--model_path",   type=str, required=True, help="预训练模型路径")
     parser.add_argument("--dataset_path", type=str, required=True, help="训练数据集路径 (.jsonl)")
     parser.add_argument("--output_dir",   type=str, required=True, help="模型检查点输出目录")
-    parser.add_argument("--beta",         type=float, required=True, help="DPO KL 散度惩罚基准系数")
+    parser.add_argument("--beta",         type=float, default=0.1, help="DPO KL 散度惩罚基准系数")
     parser.add_argument("--num_train_epochs",          type=int,   required=True)
     parser.add_argument("--gradient_accumulation_steps", type=int, required=True)
     parser.add_argument("--per_device_train_batch_size", type=int, required=True)
@@ -293,15 +298,16 @@ def main():
         help="[NCDPO] 计数误差的 tanh 归一化尺度 ε_scale（默认 2.0）"
     )
 
-    args, _ = parser.parse_known_args()
+    parser.add_argument("--image_root", default=None,
+                        help="Root for relative SFT image paths (default: dataset directory)")
+    parser.add_argument("--report_to", default="tensorboard")
+    args = parser.parse_args()
 
     freeze_vit_bool    = args.freeze_vit.lower()    == "true"
     freeze_merger_bool = args.freeze_merger.lower() == "true"
 
     print(f"训练参数: {args}")
 
-    # 梯度异常检测（调试用，生产环境可关闭）
-    torch.autograd.set_detect_anomaly(True)
 
     # ------------------------------------------------------------------
     # 2. 模型加载
@@ -320,7 +326,7 @@ def main():
     )
     model = freeze_multimodal_components(model, freeze_vit=freeze_vit_bool, freeze_merger=freeze_merger_bool)
 
-    ref_model = Qwen3VLForConditionalGeneration.from_pretrained(
+    ref_model = None if args.method == "sft" else Qwen3VLForConditionalGeneration.from_pretrained(
         args.model_path,
         config=config,
         dtype=torch.bfloat16,
@@ -332,7 +338,7 @@ def main():
     # ------------------------------------------------------------------
     # 3. 数据集加载与预处理
     # ------------------------------------------------------------------
-    train_dataset = load_dataset(
+    train_dataset = load_sft_dataset(args.dataset_path, args.image_root) if args.method == "sft" else load_dataset(
         "json",
         data_files={"train": args.dataset_path},
         split="train",
@@ -340,7 +346,7 @@ def main():
 
     # num_proc=1：避免多进程 PIL 序列化问题
     # HuggingFace .map() 会保留函数未返回的列（如 count_error_weight）
-    train_dataset = train_dataset.map(
+    train_dataset = train_dataset if args.method == "sft" else train_dataset.map(
         format_qwen_dpo_dataset,
         num_proc=1,
         desc="格式化数据集（加载图片）",
@@ -369,6 +375,7 @@ def main():
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         bf16=True,
+        report_to=args.report_to,
     )
 
     # ------------------------------------------------------------------
@@ -376,12 +383,11 @@ def main():
     # ------------------------------------------------------------------
 
     if args.method == "sft":
-        # ------ SFT（监督微调）------
-        # loss_type="sft"：只在 chosen 上计算 NLL 损失
-        training_args = DPOConfig(loss_type="sft", **common_config)
-        trainer = DPOTrainer(
+        sft_config = {key: value for key, value in common_config.items()
+                      if key not in {"beta", "precompute_ref_log_probs"}}
+        training_args = SFTConfig(completion_only_loss=True, **sft_config)
+        trainer = SFTTrainer(
             model=model,
-            ref_model=None,
             args=training_args,
             train_dataset=train_dataset,
             processing_class=processor,
@@ -459,6 +465,8 @@ def main():
     # 6. 启动训练
     # ------------------------------------------------------------------
     trainer.train()
+    trainer.save_model(args.output_dir)
+    processor.save_pretrained(args.output_dir)
 
 
 if __name__ == "__main__":

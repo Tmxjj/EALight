@@ -154,4 +154,4 @@ sanitize_omp_num_threads
 #   vglrun -d egl   -> 让 OpenGL/EGL 走 GPU 加速而不是纯软件渲染
 #   python          -> 真正执行评测逻辑
 # 一旦上面的环境变量已经设置好，整条链路都会继承相同的 GPU 可见性配置。
-xvfb-run -a -s "-screen 0 1920x1080x24" /opt/VirtualGL/bin/vglrun -d "${VGL_DEVICE}" "${HOME}/anaconda3/envs/EALight/bin/python" "${ARGS[@]}"
+exec xvfb-run -a -s "-screen 0 1920x1080x24" "${VGLRUN:-/opt/VirtualGL/bin/vglrun}" -d "${VGL_DEVICE}" "${PYTHON:-python}" "${ARGS[@]}"

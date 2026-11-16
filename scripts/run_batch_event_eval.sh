@@ -10,6 +10,9 @@
 #   bash scripts/run_batch_event_eval.sh --event emergy_bus --baseline-only
 #   bash scripts/run_batch_event_eval.sh --port 8000 --model_name ealight-8b --gpu_id 1
 
+set -uo pipefail
+FAILED_TASKS=0
+
 # ─── 默认配置 ──────────────────────────────────────────────────────────────────
 BUFFER_S=180
 MIN_SUMO_SECONDS=300
@@ -33,6 +36,12 @@ WITH_BASELINE=false
 EVENT_FILTER=""   # 可选：emergy_bus / accident_debris（不指定则两类都跑）
 
 while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        --baseline-only|--with-baseline) ;;
+        *) if [[ "$#" -lt 2 || "$2" == --* ]]; then
+               echo "Missing value for $1" >&2; exit 2
+           fi ;;
+    esac
     case $1 in
         --port)           API_PORT="$2";       shift ;;
         --model_name)     MODEL_NAME="$2";     shift ;;
@@ -54,17 +63,22 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 PROJECT_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
-export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/src:${PYTHONPATH}"
+export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}"
+cd "$PROJECT_ROOT"
 mkdir -p "$LOG_DIR"
+if [[ -n "$EVENT_FILTER" && "$EVENT_FILTER" != emergy_bus && "$EVENT_FILTER" != accident_debris ]]; then
+    echo "Unsupported event: $EVENT_FILTER" >&2
+    exit 2
+fi
 
 # ─── 数据集条目 ────────────────────────────────────────────────────────────────
 # 格式：DATASET|ENV_DIR|BASE_STEM
 # 事件路由文件 = ENV_DIR/${BASE_STEM}_{emergy_bus|accident_debris}.rou.xml
 declare -a EVENT_ENTRIES
 
-# EVENT_ENTRIES+=("JiNan|data/raw/JiNan/env|anon_3_4_jinan_real")
-# EVENT_ENTRIES+=("SouthKorea_Songdo|data/raw/SouthKorea_Songdo/env|songdo")
-# EVENT_ENTRIES+=("France_Massy|data/raw/France_Massy/env|massy")
+EVENT_ENTRIES+=("JiNan|data/raw/JiNan/env|anon_3_4_jinan_real")
+EVENT_ENTRIES+=("SouthKorea_Songdo|data/raw/SouthKorea_Songdo/env|songdo")
+EVENT_ENTRIES+=("France_Massy|data/raw/France_Massy/env|massy")
 EVENT_ENTRIES+=("Hongkong_YMT|data/raw/Hongkong_YMT/env|YMT")
 
 # 未包含在数据包中（如需使用，补充数据后取消注释）：
@@ -76,26 +90,29 @@ EVENT_TYPES=("emergy_bus" "accident_debris")
 # ─── 工具函数 ──────────────────────────────────────────────────────────────────
 
 get_max_sumo_seconds() {
-    local rou_path="$1"
-    python3 -c "
-import xml.etree.ElementTree as ET, sys
+    python3 - "$1" "$BUFFER_S" "$MIN_SUMO_SECONDS" "$MAX_SUMO_SECONDS_CAP" <<'PY_HORIZON'
+import math
+import sys
+import xml.etree.ElementTree as ET
+route, buffer, minimum, cap = sys.argv[1:]
+buffer, minimum, cap = map(int, (buffer, minimum, cap))
 try:
-    root = ET.parse('${rou_path}').getroot()
-    vals = []
-    for tag in ('vehicle', 'trip', 'flow'):
-        for v in root.findall(tag):
-            d = v.get('depart') or v.get('begin')
-            try: vals.append(float(d))
-            except: pass
-    if not vals:
-        print(${MIN_SUMO_SECONDS}); sys.exit()
-    seconds = int(max(vals) + ${BUFFER_S})
-    seconds = max(seconds, ${MIN_SUMO_SECONDS})
-    seconds = min(seconds, ${MAX_SUMO_SECONDS_CAP})
-    print(seconds)
-except Exception:
-    print(3600)
-" 2>/dev/null
+    root = ET.parse(route).getroot()
+    times = []
+    for tag in ("vehicle", "trip", "flow"):
+        for vehicle in root.findall(tag):
+            value = vehicle.get("end") if tag == "flow" else vehicle.get("depart")
+            value = value or vehicle.get("begin")
+            try:
+                number = float(value)
+                if math.isfinite(number):
+                    times.append(number)
+            except (ValueError, TypeError):
+                pass
+    print(min(cap, max(minimum, int(max(times) + buffer))) if times else minimum)
+except (OSError, ET.ParseError):
+    print(cap)
+PY_HORIZON
 }
 
 cleanup_sumo() { sleep 5; }
@@ -122,7 +139,10 @@ run_baseline() {
         --sumo_seed        "$SEED_ID" \
         "${WARM_UP_ARGS[@]}" \
         "$METHOD_FLAG"
-    [ $? -ne 0 ] && echo "  [WARNING] ${METHOD_NAME} failed: ${DATASET}/${ROUTE_FILE}"
+    if [[ $? -ne 0 ]]; then
+        FAILED_TASKS=$((FAILED_TASKS + 1))
+        echo "  [WARNING] ${METHOD_NAME} failed: ${DATASET}/${ROUTE_FILE}"
+    fi
 }
 
 run_vlm() {
@@ -131,7 +151,6 @@ run_vlm() {
     local EVENT_TYPE="$3"
     local MAX_SUMO_S="$4"
     local SEED_ID="$5"
-    local EXTRA="$6"
     local WARM_UP_ARGS=()
     [ -n "$WARM_UP_TIME" ] && WARM_UP_ARGS=(--warm_up_time "$WARM_UP_TIME")
 
@@ -145,22 +164,24 @@ run_vlm() {
         --max_sumo_seconds "$MAX_SUMO_S" \
         --sumo_seed        "$SEED_ID" \
         "${WARM_UP_ARGS[@]}" \
-        $EXTRA
-    [ $? -ne 0 ] && echo "  [WARNING] VLM failed: ${DATASET}/${ROUTE_FILE}"
+        "${EXTRA_VLM_ARGS[@]}"
+    if [[ $? -ne 0 ]]; then
+        FAILED_TASKS=$((FAILED_TASKS + 1))
+        echo "  [WARNING] VLM failed: ${DATASET}/${ROUTE_FILE}"
+    fi
 }
 
 # ─── 构建 VLM 额外参数 ─────────────────────────────────────────────────────────
-EXTRA_VLM_ARGS=""
-[ -n "$API_PORT" ] && [ -n "$MODEL_NAME" ] && \
-    EXTRA_VLM_ARGS="--api_url http://localhost:${API_PORT}/v1/chat/completions --model_name ${MODEL_NAME}"
-[ -n "$TEMPERATURE"    ] && EXTRA_VLM_ARGS="${EXTRA_VLM_ARGS} --temperature ${TEMPERATURE}"
-[ -n "$MAX_NEW_TOKENS" ] && EXTRA_VLM_ARGS="${EXTRA_VLM_ARGS} --max_new_tokens ${MAX_NEW_TOKENS}"
-[ -n "$PROMPT_BUILDER"  ] && EXTRA_VLM_ARGS="${EXTRA_VLM_ARGS} --prompt_builder ${PROMPT_BUILDER}"
-[ -n "$RESULT_NAME"     ] && EXTRA_VLM_ARGS="${EXTRA_VLM_ARGS} --result_name ${RESULT_NAME}"
-[ -n "$EVENT_BULLETIN"  ] && EXTRA_VLM_ARGS="${EXTRA_VLM_ARGS} --event_bulletin ${EVENT_BULLETIN}"
-[ -n "$GPU_ID"          ] && EXTRA_VLM_ARGS="${EXTRA_VLM_ARGS} --gpu_id ${GPU_ID}"
-[ -n "$ROBUST"          ] && EXTRA_VLM_ARGS="${EXTRA_VLM_ARGS} --robust_perturb ${ROBUST}"
-[ -n "$ROBUST_LEVEL"    ] && EXTRA_VLM_ARGS="${EXTRA_VLM_ARGS} --robust_level ${ROBUST_LEVEL}"
+EXTRA_VLM_ARGS=()
+[ -n "$API_PORT" ] && EXTRA_VLM_ARGS+=(--api_url "http://localhost:${API_PORT}/v1/chat/completions")
+[ -n "$MODEL_NAME" ] && EXTRA_VLM_ARGS+=(--model_name "$MODEL_NAME")
+[ -n "$TEMPERATURE" ] && EXTRA_VLM_ARGS+=(--temperature "$TEMPERATURE")
+[ -n "$MAX_NEW_TOKENS" ] && EXTRA_VLM_ARGS+=(--max_new_tokens "$MAX_NEW_TOKENS")
+EXTRA_VLM_ARGS+=(--prompt_builder "$PROMPT_BUILDER" --event_bulletin "$EVENT_BULLETIN")
+[ -n "$RESULT_NAME" ] && EXTRA_VLM_ARGS+=(--result_name "$RESULT_NAME")
+[ -n "$GPU_ID" ] && EXTRA_VLM_ARGS+=(--gpu_id "$GPU_ID")
+[ -n "$ROBUST" ] && EXTRA_VLM_ARGS+=(--robust_perturb "$ROBUST")
+[ -n "$ROBUST_LEVEL" ] && EXTRA_VLM_ARGS+=(--robust_level "$ROBUST_LEVEL")
 
 # ─── 打印头部信息 ──────────────────────────────────────────────────────────────
 echo "================================================================"
@@ -227,7 +248,7 @@ run_all_vlm() {
                     continue
                 fi
                 MAX_S=$(get_max_sumo_seconds "$FULL_PATH")
-                run_vlm "$DATASET" "$ROUTE_FILE" "$EVENT" "$MAX_S" "$SEED_ID" "$EXTRA_VLM_ARGS"
+                run_vlm "$DATASET" "$ROUTE_FILE" "$EVENT" "$MAX_S" "$SEED_ID"
             done
         done
     done
@@ -252,7 +273,10 @@ fi
 echo ""
 echo "================================================================"
 echo "  事件评测完成。"
-echo "  结果目录: log/eval_results/{dataset}/{route_stem}/{method}_seed_{seed}/"
+echo "  结果目录: data/eval/{dataset}/{route_stem}/{method}_seed_{seed}/"
 echo "  收集指标: 编辑 src/evaluation/metrics.py 底部的 secnario_dict 和 methods，然后运行："
 echo "    python src/evaluation/metrics.py"
 echo "================================================================"
+
+echo "Failed tasks: ${FAILED_TASKS}"
+[[ "$FAILED_TASKS" -eq 0 ]]

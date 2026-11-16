@@ -15,8 +15,5 @@ tpu_use_sudo: false
 use_cpu: false
 deepspeed_config:
   deepspeed_multinode_launcher: standard
-  gradient_accumulation_steps: 4
+  deepspeed_config_file: configs/ds_config_lora.json
   zero3_init_flag: false
-  # overlap_comm/reduce_bucket_size 等 zero_optimization 子字段在 accelerate 简化 YAML
-  # 中无法透传，必须使用外部 JSON 才能生效；完整配置见 ds_config_lora.json
-  hf_ds_config: configs/ds_config_lora.json

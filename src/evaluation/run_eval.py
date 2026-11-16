@@ -193,7 +193,14 @@ class Evaluator:
                  api_url=None, model_name_override=None, scene_type="normal",
                  temperature=None, max_new_tokens=None, sumo_seed=None,
                  prompt_builder="configs.prompt_builder", result_name=None,
-                 event_bulletin="auto", robust_perturb=None, robust_level="medium"):
+                 event_bulletin="auto", robust_perturb=None, robust_level="medium",
+                 vision_only_baseline=False, vision_only_ckpt=None):
+        self.vision_only_baseline = vision_only_baseline
+        self.vision_only_ckpt = vision_only_ckpt
+        if sum(map(bool, (use_fixed_time, use_max_pressure, use_random, vision_only_baseline))) > 1:
+            raise ValueError("Choose only one baseline mode")
+        if vision_only_baseline and not vision_only_ckpt:
+            raise ValueError("Vision-only evaluation requires a checkpoint")
         self.scenario_key = scenario_key
         self.log_dir = log_dir
         self.use_fixed_time = use_fixed_time
@@ -259,6 +266,8 @@ class Evaluator:
             model_name = "random"
         elif self.use_fixed_time:
             model_name = f"fixed_time_{FIXED_TIME_GREEN_DURATION}s"
+        elif self.vision_only_baseline:
+            model_name = self.result_name or "vision_only_baseline"
         else:
             inference_model_name = (
                 self.model_name_override
@@ -438,6 +447,8 @@ class Evaluator:
             "use_fixed_time": self.use_fixed_time,
             "use_max_pressure": self.use_max_pressure,
             "use_random": self.use_random,
+            "vision_only_baseline": self.vision_only_baseline,
+            "vision_only_ckpt": self.vision_only_ckpt,
             "warm_up_time": self.warm_up_time,
             "fixed_time_green_duration": FIXED_TIME_GREEN_DURATION
             if (self.use_fixed_time or self.use_max_pressure)
@@ -475,6 +486,9 @@ class Evaluator:
                 f"[EVAL] Running in {baseline_mode} mode. VLM skipped."
             )
             self.agent = None
+        elif self.vision_only_baseline:
+            from src.vision_only_baseline.eval_agent import build_agent_from_scenario
+            self.agent = build_agent_from_scenario(self.vision_only_ckpt, self.scenario_key)
         else:
             try:
                 logger.info("[EVAL] Initializing VLM Agent...")
@@ -946,7 +960,14 @@ if __name__ == "__main__":
                         choices=list(VALID_LEVELS),
                         help="视觉鲁棒性扰动强度档位：light / medium / heavy（默认 medium）")
 
+    parser.add_argument("--vision_only_baseline", action="store_true",
+                        help="Use the local vision-only controller; requires --vision_only_ckpt")
+    parser.add_argument("--vision_only_ckpt", default=None, help="User-trained vision checkpoint (.pth)")
     args = parser.parse_args()
+    if args.vision_only_baseline and not args.vision_only_ckpt:
+        parser.error("--vision_only_baseline requires --vision_only_ckpt")
+    if sum(map(bool, (args.fixed_time, args.max_pressure, args.random, args.vision_only_baseline))) > 1:
+        parser.error("Choose only one baseline mode")
     # 必须在 Evaluator 初始化前执行。
     # 原因是 Evaluator 内部会：
     #   1. 创建 3D 仿真与渲染环境；
@@ -978,5 +999,7 @@ if __name__ == "__main__":
         event_bulletin=args.event_bulletin,
         robust_perturb=args.robust_perturb,
         robust_level=args.robust_level,
+        vision_only_baseline=args.vision_only_baseline,
+        vision_only_ckpt=args.vision_only_ckpt,
     )
     evaluator.run_eval(max_sumo_seconds=args.max_sumo_seconds)

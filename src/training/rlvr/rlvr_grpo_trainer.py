@@ -18,6 +18,8 @@ import argparse
 import inspect
 import math
 import os
+import sys
+from pathlib import Path
 from collections import Counter, defaultdict
 from typing import Any, Callable, Dict, List, Optional
 
@@ -27,14 +29,11 @@ from datasets import load_dataset
 from transformers import AutoConfig, AutoProcessor, Qwen3VLForConditionalGeneration
 from peft import LoraConfig, TaskType, get_peft_model, PeftModel
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from src.training.rlvr.rollout_evaluator import RolloutEvaluator
 from src.training.rlvr.verifier import compute_rlvr_reward
 from src.training.trainer import freeze_multimodal_components
-from src.training.rlvr.grpo_debug_metrics import (
-    compute_reward_debug_metrics,
-    compute_loss_debug_metrics,
-    _maybe_dump_grpo_debug_samples,
-)
+
 
 try:
     from trl import GRPOConfig, GRPOTrainer
@@ -400,51 +399,16 @@ def _build_grpo_config(**kwargs):
 
 
 class Qwen3VLGRPOTrainer(GRPOTrainer if GRPOTrainer is not None else object):
-    """Qwen3-VL 的 GRPOTrainer 包装器。
-
-    新增 debug metrics 配置（通过 trainer_kwargs 或直接属性设置）：
-      log_grpo_debug_metrics:      bool  = True   — 是否开启 debug 指标
-      debug_log_samples:           bool  = False  — 是否 dump 样本到 JSONL
-      debug_log_samples_steps:     int   = 20     — 每隔多少步 dump 一次
-      debug_num_samples:           int   = 8      — 每次 dump 多少个 prompt
-      debug_reward_low_std_threshold: float = 1e-6
-      debug_output_dir:            str   = "./debug_grpo"
-    """
+    """Qwen3-VL GRPO wrapper with verifiable rewards and reward-component logging."""
 
     def __init__(
         self,
         *args,
         reward_fn: Callable[..., Dict[str, Any]],
-        log_grpo_debug_metrics: bool = True,
-        debug_log_samples: bool = False,
-        debug_log_samples_steps: int = 20,
-        debug_num_samples: int = 8,
-        debug_reward_low_std_threshold: float = 1e-6,
-        debug_output_dir: str = "./debug_grpo",
         **kwargs,
     ):
         if GRPOTrainer is None:
             raise RuntimeError("当前环境未找到 trl.GRPOTrainer，请先安装 trl==0.29.1")
-
-        # debug 配置
-        self._log_grpo_debug_metrics = log_grpo_debug_metrics
-        self._debug_log_samples = debug_log_samples
-        self._debug_log_samples_steps = debug_log_samples_steps
-        self._debug_num_samples = debug_num_samples
-        self._debug_reward_low_std_threshold = debug_reward_low_std_threshold
-        self._debug_output_dir = debug_output_dir
-
-        # 用于在 log 时合并 reward debug 指标的 buffer
-        self._pending_debug_metrics: Dict[str, float] = {}
-        # 保存本次 generate 阶段的中间数据供 dump 使用
-        self._last_gen_snapshot: Dict[str, Any] = {}
-
-        # _calculate_rewards override 存储最近一次 gather 后的全进程 rewards_per_func tensor。
-        # TRL 的 _prepare_inputs 只在 step % steps_per_generation == 0 时真正调用
-        # _generate_and_score_completions（其余 step 走 _buffered_inputs 缓存）。
-        # 用 _last_rewards_per_func 保存真正计算时的结果，供 _generate_and_score_completions
-        # override 读取，避免依赖 deque/cache 的截断问题。
-        self._last_rewards_per_func: Optional[torch.Tensor] = None  # (B*G_global, num_funcs)
 
         self._rlvr_metric_buffer = RLVRMetricBuffer()
         self._reward_fn = wrap_reward_for_grpo(
@@ -456,144 +420,11 @@ class Qwen3VLGRPOTrainer(GRPOTrainer if GRPOTrainer is not None else object):
         kwargs["reward_funcs"] = reward_funcs
         super().__init__(*args, **kwargs)
 
-    # ------------------------------------------------------------------
-    # 钩子一：_generate_and_score_completions 之后
-    #   TRL 在这个方法里计算 rewards / advantages 并存入 inputs dict，
-    #   我们通过 override 在其返回后注入 reward-level debug metrics。
-    # ------------------------------------------------------------------
-    def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
-        """调用父类实现，把 gather 后的全进程 rewards_per_func 存到 self._last_rewards_per_func。
-
-        TRL 内部 _prepare_inputs 只在 step % steps_per_generation == 0 时调用
-        _generate_and_score_completions（进而调用本方法）；其余 step 走 _buffered_inputs。
-        因此只需在这里保存一次，供 _generate_and_score_completions override 读取即可。
-        """
-        rewards_per_func = super()._calculate_rewards(inputs, prompts, completions, completion_ids_list)
-        if self._log_grpo_debug_metrics:
-            try:
-                self._last_rewards_per_func = rewards_per_func.detach().cpu()
-            except Exception:
-                pass
-        return rewards_per_func
-
-    def _generate_and_score_completions(self, inputs):
-        """调用父类实现，然后附加 reward-level debug 指标。
-
-        rewards_per_func 来自 _calculate_rewards override 存储的 _last_rewards_per_func，
-        这是 gather 后的全进程数据（shape: B*G_global × num_funcs），可直接做 group 统计。
-        """
-        result = super()._generate_and_score_completions(inputs)
-
-        if not self._log_grpo_debug_metrics:
-            return result
-
-        try:
-            completion_mask = result.get("completion_mask")  # (B_local, T)
-            num_gen = self.num_generations
-            rewards_per_func = self._last_rewards_per_func  # (B*G_global, num_funcs) or None
-
-            if rewards_per_func is not None and rewards_per_func.numel() > 0:
-                # 聚合成总 reward（nansum over funcs，复现 TRL 的做法）
-                rewards_now = rewards_per_func.float().nansum(dim=1)  # (B*G_global,)
-                reward_func_names = getattr(self, "reward_func_names", None)
-
-                debug_m = compute_reward_debug_metrics(
-                    rewards=rewards_now,
-                    rewards_per_func=rewards_per_func.float(),
-                    reward_func_names=reward_func_names,
-                    num_generations=num_gen,
-                    low_std_threshold=self._debug_reward_low_std_threshold,
-                )
-                self._pending_debug_metrics.update(debug_m)
-
-            # sample dump
-            if self._debug_log_samples and self.accelerator.is_main_process and rewards_per_func is not None:
-                rewards_now_dump = rewards_per_func.float().nansum(dim=1)
-                n_dump = rewards_now_dump.numel()
-                # TRL 0.29.1 将文本日志存储在 _textual_logs（defaultdict(list)），而非 _logs
-                _textual = getattr(self, "_textual_logs", None) or {}
-                prompts_text = list(_textual.get("prompt", []))[-n_dump:]
-                completions_text = list(_textual.get("completion", []))[-n_dump:]
-                adv_all_list = list(_textual.get("advantages", []))[-n_dump:]
-                adv_all_tensor = (
-                    torch.tensor(adv_all_list, dtype=torch.float32)
-                    if adv_all_list else torch.tensor([])
-                )
-
-                try:
-                    import wandb
-                    wandb_run = wandb.run
-                except Exception:
-                    wandb_run = None
-
-                _maybe_dump_grpo_debug_samples(
-                    global_step=self.state.global_step,
-                    prompts_text=prompts_text,
-                    completions_text=completions_text,
-                    rewards=rewards_now_dump,
-                    advantages_all=adv_all_tensor,
-                    completion_mask=completion_mask,
-                    num_generations=num_gen,
-                    reward_func_names=getattr(self, "reward_func_names", None),
-                    rewards_per_func=rewards_per_func.float(),
-                    dump_steps=self._debug_log_samples_steps,
-                    num_samples=self._debug_num_samples,
-                    output_dir=self._debug_output_dir,
-                    is_main_process=True,
-                    wandb_run=wandb_run,
-                )
-        except Exception:
-            pass  # debug 逻辑绝不影响训练主流程
-
-        return result
-
-    # ------------------------------------------------------------------
-    # 钩子二：_compute_loss 之后
-    #   通过 override compute_loss 获取 logps / mask / advantage。
-    # ------------------------------------------------------------------
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """调用父类 loss，然后附加 advantage / ratio / length debug 指标。"""
-        loss = super().compute_loss(model, inputs, return_outputs=return_outputs,
-                                    num_items_in_batch=num_items_in_batch)
-
-        if not self._log_grpo_debug_metrics:
-            return loss
-
-        try:
-            with torch.no_grad():
-                advantages = inputs.get("advantages")
-                completion_mask = inputs.get("completion_mask")
-                old_logps = inputs.get("old_per_token_logps")
-
-                if advantages is not None and completion_mask is not None:
-                    adv_metrics = compute_loss_debug_metrics(
-                        advantages=advantages,
-                        per_token_logps=old_logps if old_logps is not None else torch.zeros_like(completion_mask.float()),
-                        old_per_token_logps=old_logps if old_logps is not None else torch.zeros_like(completion_mask.float()),
-                        completion_mask=completion_mask,
-                        epsilon_low=getattr(self, "epsilon_low", 0.2),
-                        epsilon_high=getattr(self, "epsilon_high", 0.2),
-                    )
-                    # num_iterations=1 且不使用 vLLM IS 时，old_logps == per_token_logps，
-                    # ratio ≈ 1，debug/policy_ratio_* 数值接近常数，仅供参考；
-                    # 使用 vLLM importance sampling 时才有完整诊断价值。
-                    self._pending_debug_metrics.update(adv_metrics)
-        except Exception:
-            pass
-
-        return loss
-
-    # ------------------------------------------------------------------
-    # 钩子三：log() — 把所有 pending debug metrics 一起推给 Trainer.log
-    # ------------------------------------------------------------------
     def log(self, logs: Dict[str, float], *args, **kwargs):  # type: ignore[override]
-        """Append RLVR reward diagnostics and debug metrics to Trainer logs."""
+        """Append RLVR reward-component metrics to standard Trainer logs."""
         if isinstance(logs, dict):
             logs = dict(logs)
             logs.update(self._rlvr_metric_buffer.flush())
-            if self._log_grpo_debug_metrics and self._pending_debug_metrics:
-                logs.update(self._pending_debug_metrics)
-                self._pending_debug_metrics = {}
         return super().log(logs, *args, **kwargs)
 
 
@@ -669,7 +500,7 @@ def build_trainer_from_args(args) -> Qwen3VLGRPOTrainer:
         config=config,
         dtype=torch.bfloat16,
         device_map=None,
-        attn_implementation="flash_attention_2",
+        attn_implementation=args.attn_implementation,
     )
     # LoRA：只对语言解码器的 attention/MLP projection 插入 adapter，ViT/Merger 冻结不受影响
     if args.use_lora.lower() == "true":
@@ -709,7 +540,7 @@ def build_trainer_from_args(args) -> Qwen3VLGRPOTrainer:
         warmup_steps=args.warmup_steps,
         max_steps=args.max_steps,
         save_strategy="steps",
-        save_steps=2,
+        save_steps=args.save_steps,
         # save_strategy="epoch",
         save_only_model=True,
         save_total_limit=8,
@@ -746,13 +577,6 @@ def build_trainer_from_args(args) -> Qwen3VLGRPOTrainer:
         train_dataset=train_dataset,
         processing_class=processor,
         reward_fn=compute_rlvr_reward,
-        # debug metrics 配置
-        log_grpo_debug_metrics=getattr(args, "log_grpo_debug_metrics", True),
-        debug_log_samples=getattr(args, "debug_log_samples", False),
-        debug_log_samples_steps=getattr(args, "debug_log_samples_steps", 20),
-        debug_num_samples=getattr(args, "debug_num_samples", 8),
-        debug_reward_low_std_threshold=getattr(args, "debug_reward_low_std_threshold", 1e-6),
-        debug_output_dir=getattr(args, "debug_output_dir", "./debug_grpo"),
     )
     return trainer
 
@@ -760,6 +584,8 @@ def build_trainer_from_args(args) -> Qwen3VLGRPOTrainer:
 def parse_args():
     """命令行参数。"""
     parser = argparse.ArgumentParser(description="Qwen3-VL RLVR / GRPO 训练入口")
+    parser.add_argument("--attn_implementation", choices=("sdpa", "flash_attention_2", "eager"), default="sdpa")
+    parser.add_argument("--save_steps", type=int, default=50)
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--dataset_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
@@ -810,21 +636,6 @@ def parse_args():
     parser.add_argument("--vllm_max_model_length", type=int, default=None)
     parser.add_argument("--num_iterations", type=int, default=1)
     parser.add_argument("--bf16", action="store_true")
-    # debug metrics 配置
-    parser.add_argument("--log_grpo_debug_metrics", action="store_true", default=True,
-                        help="开启 GRPO debug metrics（group reward std / advantage / completion length 等）。")
-    parser.add_argument("--no_log_grpo_debug_metrics", dest="log_grpo_debug_metrics", action="store_false",
-                        help="关闭 GRPO debug metrics。")
-    parser.add_argument("--debug_log_samples", action="store_true", default=False,
-                        help="每隔 debug_log_samples_steps 步将样本 dump 到 JSONL。")
-    parser.add_argument("--debug_log_samples_steps", type=int, default=20,
-                        help="样本 dump 间隔步数。")
-    parser.add_argument("--debug_num_samples", type=int, default=8,
-                        help="每次 dump 的 prompt 数量（每个 prompt 含 G 个 completion）。")
-    parser.add_argument("--debug_reward_low_std_threshold", type=float, default=1e-6,
-                        help="group reward std 低于此阈值视为 low-std（学习信号弱）。")
-    parser.add_argument("--debug_output_dir", type=str, default="./debug_grpo",
-                        help="样本 JSONL dump 目录。")
     return parser.parse_args()
 
 
@@ -836,6 +647,8 @@ def main() -> None:
         os.environ.setdefault("WANDB_DISABLED", "true")
     trainer = build_trainer_from_args(args)
     trainer.train()
+    trainer.save_model(args.output_dir)
+    trainer.processing_class.save_pretrained(args.output_dir)
 
 
 if __name__ == "__main__":
