@@ -1,18 +1,16 @@
-# EALight: Event-Aware Traffic Signal Control via Vision-Language World Knowledge
-
-> Training / 训练说明：[guide](docs/training_and_evaluation.md) · [vision-only](src/vision_only_baseline/README.md).
+# EALight: A Vision-Grounded LVLM Controller for Event-Aware Traffic Signal Control
 
 > **[中文说明见下方 / Chinese version below ↓](#中文说明)**
 
 ---
 
-## Project Structure
+## 1. Project Structure
 
 ```
 EALight/
 ├── README.md
 ├── requirements.txt
-├── install_deps.sh             # One-command environment setup
+├── install_deps.sh             # System and Python dependency installation
 ├── vgl_python.sh               # VirtualGL launcher for headless 3D rendering
 │
 ├── configs/
@@ -49,18 +47,17 @@ EALight/
 │       └── tsc_env/            # TSC wrapper: action decode, state management
 │
 ├── scripts/
+│   ├── event_scene_generation/ # Event route generation / 事件路由生成
 │   ├── run_batch_event_eval.sh # Batch evaluation (baselines + VLM + all event types)
 │   ├── add_lane_watermarks.py  # Add directional labels to intersection images
 │   ├── visual_robustness.py    # Visual perturbation pipeline (occlusion / noise / lowres)
 │   └── download_model.py       # Download base LVLM from ModelScope
 │
 ├── TransSimHub/                # 3D traffic simulation environment
-│   │                           # Full source + 3D assets hosted on anonymous GitHub:
-│   │                           #   <ANONYMOUS_TRANSSIMHUB_GITHUB_URL>
 │   └── tshub/                  # Core Python package (pip install -e .)
 │
 └── data/
-    └── raw/                    # Included in this software package
+    └── raw/                    # Download map/scenario assets here (Step 4)
         ├── JiNan/              # 12-intersection, real traffic (China)
         ├── SouthKorea_Songdo/  # Large asymmetric 6-lane junction
         ├── France_Massy/       # T-junction (2-phase)
@@ -68,11 +65,13 @@ EALight/
         └── Syn-Train/          # 4×4 synthetic grid (for RLVR training rollouts)
 ```
 
-> **TransSimHub** (with 3D vehicle assets, ~650 MB) is hosted separately on an anonymous GitHub repository due to file size. Clone it as described in Step 3 below.
+> Install the project-specific TransSimHub fork in Step 3, then prepare map/scenario and 3D vehicle assets in Step 4.
 
 ---
 
-## Requirements
+## 2. Installation
+
+**Requirements**
 
 | Component | Version |
 |-----------|---------|
@@ -80,20 +79,16 @@ EALight/
 | SUMO | ≥ 1.20 |
 | CUDA | ≥ 11.8 |
 | VirtualGL | 3.1 (headless GPU 3D rendering) |
-| GPU VRAM | ≥ 40 GB (eval); 4 × 80 GB A100 recommended for RLVR training |
+| GPU VRAM | ≥ 30 GB (evaluation) |
 
----
-
-## Installation
-
-### Step 1 — Create Conda environment
+### 2.1 Step 1 — Create Conda environment
 
 ```bash
 conda create -n EALight python=3.10 -y
 conda activate EALight
 ```
 
-### Step 2 — Install system dependencies and Python packages
+### 2.2 Step 2 — Install system dependencies and Python packages
 
 ```bash
 bash install_deps.sh
@@ -119,22 +114,66 @@ sudo dpkg -i virtualgl.deb || sudo apt install -f -y
 pip install -r requirements.txt
 ```
 
-### Step 3 — Install TransSimHub (3D simulation environment)
+### 2.3 Step 3 — Install TransSimHub (3D simulation environment)
 
-TransSimHub (full source + 3D vehicle assets) is hosted on an anonymous GitHub repository.
+Install the project's [TransSimHub fork](https://github.com/Tmxjj/TransSimHub) in the same Python environment. This repository is **forked from [Traffic-Alpha/TransSimHub](https://github.com/Traffic-Alpha/TransSimHub)** and includes project-specific extensions:
 
 ```bash
-# Clone the anonymous repository
-git clone https://anonymous.4open.science/r/EMNLP-5798/ TransSimHub
+git clone https://github.com/Tmxjj/TransSimHub.git /path/to/TransSimHub
+python -m pip install -e '/path/to/TransSimHub[all]'
+export SUMO_HOME=/usr/share/sumo  # Adjust to your SUMO installation.
+export PYTHONPATH="$PWD:$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+```
 
-# Install as a Python package
-cd TransSimHub && pip install -e . && cd ..
+Run these commands from the EALight repository root, replacing `/path/to/TransSimHub` with your local destination. If you use the existing `TransSimHub/` directory, ensure it contains the required fork before installing it.
+
+[`install_deps.sh`](./install_deps.sh) provides system and Python dependency installation commands. [`vgl_python.sh`](./vgl_python.sh) uses the active environment's Python by default; override `PYTHON` or `VGLRUN` if needed. The single-scenario example below invokes Xvfb/VirtualGL directly with the active Python environment.
+
+### 2.4 Step 4 — Prepare simulation and 3D assets
+
+Download and extract the [map/scenario assets](https://drive.google.com/drive/folders/1oTIScFrKsmmwSaG6bGCBmkSHD3fWdq86?usp=sharing) into `data/raw/`. Extract the [vehicle models](https://github.com/Traffic-Alpha/TransSimHub/releases/download/v5/vehicles_models.zip) into `tshub/tshub_env3d/_assets_3d/` inside the installed TransSimHub checkout (for example, `/path/to/TransSimHub/tshub/tshub_env3d/_assets_3d/`).
+
+Check that each scenario has the files required by the evaluator, for example:
+
+```text
+data/raw/JiNan/
+├── jinan.sumocfg
+├── env/                        # Network and route files referenced by SUMO
+├── add/
+│   ├── e2.add.xml
+│   └── tls_programs.add.xml
+└── 3d_assets/
+```
+
+[`scripts/event_scene_generation/`](./scripts/event_scene_generation) provides utilities for emergency vehicles, buses, accidents, road debris, pedestrians, and mixed events. The corresponding event routes are already included in `data/` and can be used directly for evaluation. To change the random seed or event proportions, edit parameters such as `SEED`, `EMERGENCY_RATIO`, `BUS_RATIO`, `ACCIDENT_RATE`, and `DEBRIS_RATE` in the batch generator, then regenerate the mixed event routes:
+
+```bash
+bash scripts/event_scene_generation/batch_generate_mixed_events.sh
 ```
 
 
-### Step 4 — Prepare the model
+**Datasets**
 
-This repository provides EALight and vision-only training/evaluation scripts. Obtain the base **Qwen3-VL-8B-Instruct** model independently and train locally. The base model can validate the evaluation pipeline, but its results do not reproduce a trained EALight checkpoint. See [the training and evaluation guide](docs/training_and_evaluation.md) for data contracts and commands.
+| Dataset | Intersections | Phase Space | Asset source |
+|---------|:---:|:---:|:---:|
+| JiNan (China) | 12 | 4-phase | Download |
+| SouthKorea\_Songdo | 1 | 4-phase | Download |
+| France\_Massy | 1 | 2-phase | Download |
+| Hongkong\_YMT | 1 | 3-phase | Download |
+| Syn-Train (4×4 grid) | 16 | 4-phase | Download (training only) |
+| Hangzhou (China) | 16 | 4-phase | Download |
+| New York | 196 | 4-phase | Download |
+
+**Event route files** (automatically paired with each scenario):
+
+| Suffix | Events | Key metrics |
+|--------|--------|-------------|
+| `*_emergy_bus.rou.xml` | Emergency vehicles + school/transit buses | sp-ATT, sp-AWT |
+| `*_accident_debris.rou.xml` | Traffic accidents + road debris / construction | MaxQL, TCR |
+
+### 2.5 Step 5 — Prepare the model
+
+This repository provides EALight and vision-only training/evaluation scripts. Obtain the base **Qwen3-VL-8B-Instruct** model independently and train locally. The base model can validate the evaluation pipeline, but its results do not reproduce a trained EALight checkpoint.
 
 ```bash
 # Download base model from ModelScope (recommended for users in China)
@@ -152,19 +191,19 @@ After downloading, update `configs/model_config.py` (`requests.model_name`) and 
 
 ---
 
-## Evaluation
+## 3. Evaluation
 
-The `data/` directory is already included in this software package — no separate download required.
+Complete Step 4 first to prepare the simulation and 3D assets. The event routes included in `data/` can be used directly for the examples.
 
-### Run baseline methods (no GPU required)
+### 3.1 Run baseline methods (no GPU required)
 
 ```bash
 bash scripts/run_batch_event_eval.sh --baseline-only
 ```
 
-This runs **FixedTime** and **MaxPressure** across all included scenarios and event types.
+This runs **FixedTime** and **MaxPressure** across all enabled scenarios and event types.
 
-### Run EALight evaluation
+### 3.2 Run EALight evaluation
 
 **Step 1** — Start the vLLM inference server (edit model path first):
 
@@ -183,6 +222,20 @@ bash scripts/run_batch_event_eval.sh --event emergy_bus      --port 8000 --model
 bash scripts/run_batch_event_eval.sh --event accident_debris --port 8000 --model_name qwen3-vl-8b --result_name ealight
 ```
 
+To evaluate one prepared scenario directly (adjust the VirtualGL path if needed):
+
+```bash
+xvfb-run -a /opt/VirtualGL/bin/vglrun -d egl python src/evaluation/run_eval.py \
+  --scenario JiNan \
+  --route_file anon_3_4_jinan_real_emergy_bus.rou.xml \
+  --scene_type emergy_bus \
+  --api_url http://localhost:8000/v1/chat/completions \
+  --model_name qwen3-vl-8b \
+  --result_name ealight \
+  --max_sumo_seconds 3600 \
+  --sumo_seed 42
+```
+
 **Step 3** — Collect and display results:
 
 ```bash
@@ -194,26 +247,24 @@ python src/evaluation/metrics.py
 The script prints `ATT`, `AWT`, `sp-ATT`, `sp-AWT`, `MaxQL`, and `TCR` for each
 `(scenario, route_file, method)` combination.
 
-### Dataset configuration
+### 3.3 Dataset configuration
 
-The batch script (`scripts/run_batch_event_eval.sh`) includes four datasets by default.
-To add datasets not in this package (Hangzhou, New York), place the data under `data/raw/`
+The batch script (`scripts/run_batch_event_eval.sh`) enables four scenarios by default.
+To evaluate Hangzhou or New York, download the corresponding assets into `data/raw/`, check that the required event routes are present,
 and uncomment the corresponding lines in the `EVENT_ENTRIES` section.
 
 ---
 
-## Training
+## 4. Training
 
-> Source and launch scripts are provided; trained checkpoints and annotated SFT/RLVR datasets must be prepared locally. See [the detailed guide](docs/training_and_evaluation.md) and [vision-only instructions](src/vision_only_baseline/README.md).
-
-### Phase 1 — Supervised Fine-Tuning (SFT)
+### 4.1 Phase 1 — Supervised Fine-Tuning (SFT)
 
 ```bash
 # Override MODEL_PATH, DATA_PATH and OUTPUT_DIR as needed
 bash src/training/sft_trainer.sh
 ```
 
-### Phase 2 — RLVR Training (GRPO with Cached Rollout Rewards)
+### 4.2 Phase 2 — RLVR Training (GRPO with Cached Rollout Rewards)
 
 ```bash
 # Step 1: Convert raw samples that already contain cached SUMO rollout rewards
@@ -228,30 +279,7 @@ bash src/training/rlvr_trainer.sh
 
 ---
 
-## Datasets
-
-| Dataset | Intersections | Phase Space | Included |
-|---------|:---:|:---:|:---:|
-| JiNan (China) | 12 | 4-phase | ✓ |
-| SouthKorea\_Songdo | 1 | 4-phase | ✓ |
-| France\_Massy | 1 | 2-phase | ✓ |
-| Hongkong\_YMT | 1 | 3-phase | ✓ |
-| Syn-Train (4×4 grid) | 16 | 4-phase | ✓ (training only) |
-| Hangzhou (China) | 16 | 4-phase | — |
-| New York | 196 | 4-phase | — |
-
-> **Note on Hangzhou and New York**: These two datasets involve substantially larger simulation environments. Due to file size constraints in the submission package, they are not included here. Both datasets will be made publicly available upon paper acceptance.
-
-**Event route files** (automatically paired with each scenario):
-
-| Suffix | Events | Key metrics |
-|--------|--------|-------------|
-| `*_emergy_bus.rou.xml` | Emergency vehicles + school/transit buses | sp-ATT, sp-AWT |
-| `*_accident_debris.rou.xml` | Traffic accidents + road debris / construction | MaxQL, TCR |
-
----
-
-## Key Metrics
+## 5. Key Metrics
 
 | Metric | Description |
 |--------|-------------|
@@ -262,7 +290,7 @@ bash src/training/rlvr_trainer.sh
 
 ---
 
-## Key Configuration Files
+## 6. Key Configuration Files
 
 | File | What to configure |
 |------|-------------------|
@@ -273,7 +301,7 @@ bash src/training/rlvr_trainer.sh
 
 ---
 
-## License
+## 7. License
 
 The EALight code is released under the **MIT License**.  
 TransSimHub is released under its original license (see `TransSimHub/LICENSE`).
@@ -283,17 +311,17 @@ TransSimHub is released under its original license (see `TransSimHub/LICENSE`).
 
 # 中文说明
 
-> **[English version above ↑](#ealight-event-aware-traffic-signal-control-via-vision-language-world-knowledge)**
+> **[English version above ↑](#ealight-a-vision-grounded-lvlm-controller-for-event-aware-traffic-signal-control)**
 
 ---
 
-## 项目结构
+## 1. 项目结构
 
 ```
 EALight/
 ├── README.md
 ├── requirements.txt
-├── install_deps.sh             # 一键环境配置
+├── install_deps.sh             # 系统与 Python 依赖安装
 ├── vgl_python.sh               # 无头服务器 VirtualGL 启动器
 │
 ├── configs/                    # 配置文件
@@ -330,18 +358,17 @@ EALight/
 │       └── tsc_env/            # TSC 封装：动作解码、状态管理
 │
 ├── scripts/
+│   ├── event_scene_generation/ # Event route generation / 事件路由生成
 │   ├── run_batch_event_eval.sh # 批量评测（基线 + VLM + 所有事件类型）
 │   ├── add_lane_watermarks.py  # 为路口图像添加方向水印
 │   ├── visual_robustness.py    # 视觉鲁棒性扰动流水线
 │   └── download_model.py       # 从 ModelScope 下载基础模型
 │
 ├── TransSimHub/                # 3D 交通仿真环境
-│   │                           # 完整源码 + 3D 资产托管于匿名 GitHub：
-│   │                           #   <ANONYMOUS_TRANSSIMHUB_GITHUB_URL>
 │   └── tshub/                  # 核心 Python 包（pip install -e .）
 │
 └── data/
-    └── raw/                    # 与代码一同打包，无需单独下载
+    └── raw/                    # 下载地图/场景资源至此（步骤 4）
         ├── JiNan/              # 12 路口，真实交通流（中国济南）
         ├── SouthKorea_Songdo/  # 大型非对称 6 车道路口
         ├── France_Massy/       # T 字路口（2 相位）
@@ -349,12 +376,13 @@ EALight/
         └── Syn-Train/          # 4×4 合成路网（RLVR 训练用）
 ```
 
-> **TransSimHub**（含 3D 车辆资产，约 650 MB）因文件体积较大，单独托管于匿名 GitHub 仓库。
-> 按下方步骤 3 克隆即可。
+> 按步骤 3 安装本项目使用的 TransSimHub 分支，再按步骤 4 准备地图/场景及 3D 车辆资源。
 
 ---
 
-## 环境要求
+## 2. 安装步骤
+
+**环境要求**
 
 | 组件 | 版本 |
 |------|------|
@@ -362,20 +390,16 @@ EALight/
 | SUMO | ≥ 1.20 |
 | CUDA | ≥ 11.8 |
 | VirtualGL | 3.1（无头服务器 GPU 渲染） |
-| GPU 显存 | 评测 ≥ 40 GB；RLVR 训练推荐 4 × A100 80 GB |
+| GPU 显存 | 评测 ≥ 30 GB |
 
----
-
-## 安装步骤
-
-### 步骤 1 — 创建 Conda 环境
+### 2.1 步骤 1 — 创建 Conda 环境
 
 ```bash
 conda create -n EALight python=3.10 -y
 conda activate EALight
 ```
 
-### 步骤 2 — 安装系统依赖与 Python 包
+### 2.2 步骤 2 — 安装系统依赖与 Python 包
 
 ```bash
 bash install_deps.sh
@@ -401,22 +425,66 @@ sudo dpkg -i virtualgl.deb || sudo apt install -f -y
 pip install -r requirements.txt
 ```
 
-### 步骤 3 — 安装 TransSimHub（3D 仿真环境）
+### 2.3 步骤 3 — 安装 TransSimHub（3D 仿真环境）
 
-TransSimHub 完整版（含 3D 车辆资产）托管于匿名 GitHub 仓库。
+在同一 Python 环境中安装本项目使用的 [TransSimHub fork](https://github.com/Tmxjj/TransSimHub)。该仓库 **fork 自 [Traffic-Alpha/TransSimHub](https://github.com/Traffic-Alpha/TransSimHub)**，并在此基础上扩展：
 
 ```bash
-# 克隆匿名仓库
-git clone https://anonymous.4open.science/r/EMNLP-5798/ TransSimHub
+git clone https://github.com/Tmxjj/TransSimHub.git /path/to/TransSimHub
+python -m pip install -e '/path/to/TransSimHub[all]'
+export SUMO_HOME=/usr/share/sumo  # 按实际 SUMO 安装位置调整。
+export PYTHONPATH="$PWD:$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+```
 
-# 安装为 Python 包
-cd TransSimHub && pip install -e . && cd ..
+请在 EALight 项目根目录执行上述命令，并将 `/path/to/TransSimHub` 替换为本机目标路径。如果使用已有的 `TransSimHub/` 目录，请先确认其中包含所需分支，再安装。
+
+[`install_deps.sh`](./install_deps.sh) 提供系统依赖与 Python 包安装命令。[`vgl_python.sh`](./vgl_python.sh) 默认使用当前环境的 Python，可按需通过 `PYTHON` 和 `VGLRUN` 覆盖路径。下方单场景示例直接调用 Xvfb/VirtualGL，并使用当前环境中的 Python。
+
+### 2.4 步骤 4 — 准备仿真与 3D 资源
+
+将[地图/场景资源](https://drive.google.com/drive/folders/1oTIScFrKsmmwSaG6bGCBmkSHD3fWdq86?usp=sharing)下载并解压至 `data/raw/`，将[车辆模型](https://github.com/Traffic-Alpha/TransSimHub/releases/download/v5/vehicles_models.zip)解压至实际安装的 TransSimHub 目录下的 `tshub/tshub_env3d/_assets_3d/`（例如 `/path/to/TransSimHub/tshub/tshub_env3d/_assets_3d/`）。
+
+核对各场景是否具备评估入口所需的文件，例如：
+
+```text
+data/raw/JiNan/
+├── jinan.sumocfg
+├── env/                        # SUMO 配置引用的路网与路由文件
+├── add/
+│   ├── e2.add.xml
+│   └── tls_programs.add.xml
+└── 3d_assets/
+```
+
+[`scripts/event_scene_generation/`](./scripts/event_scene_generation) 提供紧急车辆、公交、事故、道路障碍、行人及混合事件生成工具。`data/` 中已包含对应的事件路由，可直接用于评测。如需修改随机种子、事件比例或发生频率，请调整批量生成脚本中的 `SEED`、`EMERGENCY_RATIO`、`BUS_RATIO`、`ACCIDENT_RATE`、`DEBRIS_RATE` 等参数，再运行以下命令重新生成混合事件路由：
+
+```bash
+bash scripts/event_scene_generation/batch_generate_mixed_events.sh
 ```
 
 
-### 步骤 4 — 准备模型
+**数据集说明**
 
-仓库提供 EALight 和 vision-only 的训练、评测代码及启动脚本，请自行获取 **Qwen3-VL-8B-Instruct** 基础模型并训练。基础模型可验证评测流程，但其结果不能代表已训练 EALight 的性能。数据要求和运行命令见[训练与评测指南](docs/training_and_evaluation.md)。
+| 数据集 | 路口数 | 相位数 | 资源来源 |
+|--------|:---:|:---:|:---:|
+| 济南 JiNan（中国） | 12 | 4 | 下载 |
+| 松岛 SouthKorea\_Songdo | 1 | 4 | 下载 |
+| 马西 France\_Massy | 1 | 2 | 下载 |
+| 油麻地 Hongkong\_YMT | 1 | 3 | 下载 |
+| Syn-Train 合成路网 | 16 | 4 | 下载（仅训练） |
+| 杭州 Hangzhou（中国） | 16 | 4 | 下载 |
+| 纽约 New York | 196 | 4 | 下载 |
+
+**事件路由文件**（自动与各场景配对）：
+
+| 文件后缀 | 注入事件类型 | 核心指标 |
+|----------|------------|---------|
+| `*_emergy_bus.rou.xml` | 紧急车辆（消防/救护/警车）+ 校车与公交 | sp-ATT、sp-AWT |
+| `*_accident_debris.rou.xml` | 交通事故（碰撞/异常停驻）+ 路面碎片/施工占道 | MaxQL、TCR |
+
+### 2.5 步骤 5 — 准备模型
+
+仓库提供 EALight 和 vision-only 的训练、评测代码及启动脚本，请自行获取 **Qwen3-VL-8B-Instruct** 基础模型并训练。基础模型可验证评测流程，但其结果不能代表已训练 EALight 的性能。
 
 ```bash
 # 从 ModelScope 下载基础模型（国内推荐）
@@ -434,19 +502,19 @@ snapshot_download('Qwen/Qwen3-VL-8B-Instruct', local_dir='models/Qwen3-VL-8B-Ins
 
 ---
 
-## 评测
+## 3. 评测
 
-数据集已包含在本软件包 `data/` 目录中，**无需单独下载**。
+请先按步骤 4 准备仿真与 3D 资源。示例可直接使用 `data/` 中已有的事件路由。
 
-### 运行基线方法（无需 GPU）
+### 3.1 运行基线方法（无需 GPU）
 
 ```bash
 bash scripts/run_batch_event_eval.sh --baseline-only
 ```
 
-自动在所有包含场景上运行 **FixedTime** 和 **MaxPressure** 基线（含事件路由）。
+自动在所有启用场景上运行 **FixedTime** 和 **MaxPressure** 基线（含事件路由）。
 
-### 运行 EALight 评测
+### 3.2 运行 EALight 评测
 
 **第 1 步** — 启动 vLLM 推理服务（先编辑模型路径）：
 
@@ -465,6 +533,20 @@ bash scripts/run_batch_event_eval.sh --event emergy_bus      --port 8000 --model
 bash scripts/run_batch_event_eval.sh --event accident_debris --port 8000 --model_name qwen3-vl-8b --result_name ealight
 ```
 
+也可直接评测单个已准备好的场景（按实际安装位置调整 VirtualGL 路径）：
+
+```bash
+xvfb-run -a /opt/VirtualGL/bin/vglrun -d egl python src/evaluation/run_eval.py \
+  --scenario JiNan \
+  --route_file anon_3_4_jinan_real_emergy_bus.rou.xml \
+  --scene_type emergy_bus \
+  --api_url http://localhost:8000/v1/chat/completions \
+  --model_name qwen3-vl-8b \
+  --result_name ealight \
+  --max_sumo_seconds 3600 \
+  --sumo_seed 42
+```
+
 **第 3 步** — 汇总结果：
 
 ```bash
@@ -474,26 +556,24 @@ python src/evaluation/metrics.py
 
 脚本将每个 `（场景、路由文件、方法）` 组合的 `ATT`、`AWT`、`sp-ATT`、`sp-AWT`、`MaxQL`、`TCR` 指标直接打印至标准输出。
 
-### 数据集配置说明
+### 3.3 数据集配置说明
 
-评测脚本 `scripts/run_batch_event_eval.sh` 默认激活 4 个包内数据集。
-如需加入 Hangzhou、New York 等未包含的数据集，请将数据放至 `data/raw/` 对应目录，
-然后取消脚本中 `EVENT_ENTRIES` 相关行的注释即可。
+评测脚本 `scripts/run_batch_event_eval.sh` 默认激活 4 个场景。
+如需评测 Hangzhou、New York，请下载数据至 `data/raw/` 对应目录并确认所需事件路由已就绪，
+然后取消脚本中 `EVENT_ENTRIES` 相关行的注释。
 
 ---
 
-## 训练
+## 4. 训练
 
-> 训练权重和标注数据需自行准备，详见[训练与评测指南](docs/training_and_evaluation.md)及[纯视觉基线说明](src/vision_only_baseline/README.md)。
-
-### 阶段 1 — 监督微调（SFT）
+### 4.1 阶段 1 — 监督微调（SFT）
 
 ```bash
 # 按需通过环境变量配置 MODEL_PATH、DATA_PATH、OUTPUT_DIR
 bash src/training/sft_trainer.sh
 ```
 
-### 阶段 2 — RLVR 训练（GRPO + 缓存 rollout 奖励）
+### 4.2 阶段 2 — RLVR 训练（GRPO + 缓存 rollout 奖励）
 
 ```bash
 # 第 1 步：转换已包含 SUMO rollout 缓存奖励的原始样本
@@ -508,30 +588,7 @@ bash src/training/rlvr_trainer.sh
 
 ---
 
-## 数据集说明
-
-| 数据集 | 路口数 | 相位数 | 是否包含 |
-|--------|:---:|:---:|:---:|
-| 济南 JiNan（中国） | 12 | 4 | ✓ |
-| 松岛 SouthKorea\_Songdo | 1 | 4 | ✓ |
-| 马西 France\_Massy | 1 | 2 | ✓ |
-| 油麻地 Hongkong\_YMT | 1 | 3 | ✓ |
-| Syn-Train 合成路网 | 16 | 4 | ✓（仅训练） |
-| 杭州 Hangzhou（中国） | 16 | 4 | — |
-| 纽约 New York | 196 | 4 | — |
-
-> **关于 Hangzhou 与 New York**：这两个数据集对应规模较大的仿真场景，文件体积超出本次提交包的限制，暂未随代码一同打包。论文接受后，两个数据集将随完整代码一并公开发布。
-
-**事件路由文件**（自动与各场景配对）：
-
-| 文件后缀 | 注入事件类型 | 核心指标 |
-|----------|------------|---------|
-| `*_emergy_bus.rou.xml` | 紧急车辆（消防/救护/警车）+ 校车与公交 | sp-ATT、sp-AWT |
-| `*_accident_debris.rou.xml` | 交通事故（碰撞/异常停驻）+ 路面碎片/施工占道 | MaxQL、TCR |
-
----
-
-## 核心指标说明
+## 5. 核心指标说明
 
 | 指标 | 说明 |
 |------|------|
@@ -542,7 +599,7 @@ bash src/training/rlvr_trainer.sh
 
 ---
 
-## 关键配置项
+## 6. 关键配置项
 
 | 文件 | 需配置内容 |
 |------|-----------|
@@ -553,7 +610,7 @@ bash src/training/rlvr_trainer.sh
 
 ---
 
-## 开源协议
+## 7. 开源协议
 
 EALight 代码以 **MIT License** 开源发布。  
 TransSimHub 依据其原始协议发布（详见 `TransSimHub/LICENSE`）。
